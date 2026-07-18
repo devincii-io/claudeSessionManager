@@ -80,6 +80,16 @@ class Bridge(QObject):
         self._watcher.watch_scratchpad(scratch.get("dir") or None)
         return _j(data)
 
+    @Slot(str, str, int, int, result=str)
+    def getTranscriptBefore(self, project_id: str, session_id: str, before: int, count: int) -> str:
+        jsonl = paths.projects_dir() / project_id / f"{session_id}.jsonl"
+        return _j(self._scanner.transcript_before(jsonl, before, count))
+
+    @Slot(str, str, int, result=str)
+    def getTranscriptAfter(self, project_id: str, session_id: str, after: int) -> str:
+        jsonl = paths.projects_dir() / project_id / f"{session_id}.jsonl"
+        return _j(self._scanner.transcript_after(jsonl, after))
+
     @Slot(str, result=str)
     def searchAll(self, query: str) -> str:
         return _j(self._scanner.search_all(query))

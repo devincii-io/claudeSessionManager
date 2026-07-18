@@ -316,8 +316,27 @@ def _condense_block(block: dict) -> dict | None:
     return {"type": btype or "unknown"}
 
 
+_FILE_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit")
+
+
+def _downsample(seq: list, cap: int = 300) -> list:
+    if len(seq) <= cap:
+        return list(seq)
+    step = len(seq) / cap
+    return [seq[int(i * step)] for i in range(cap)]
+
+
+def _clean(e: dict) -> dict:
+    return {k: v for k, v in e.items() if k != "_merge_id"}
+
+
 class DetailBuilder:
-    """Reconstructs the transcript + chart aggregates; feed() incrementally."""
+    """Reconstructs the transcript + rich analytics; feed() incrementally.
+
+    The full event list stays in memory but is *never* serialized whole — the
+    scanner serves paged windows over it, and everything chart-shaped is
+    pre-aggregated here so every tab's payload stays small and O(window).
+    """
 
     def __init__(self) -> None:
         self.events: list[dict] = []
@@ -326,6 +345,44 @@ class DetailBuilder:
         self.by_model: dict[str, pricing.Usage] = {}
         self.tool_counts: Counter[str] = Counter()
         self.timeline: list[dict] = []
+        # analytics aggregates
+        self.user_prompts = 0
+        self.tool_errors: Counter[str] = Counter()
+        self.tool_error_total = 0
+        self._tool_id_name: dict[str, str] = {}
+        self.files_touched: Counter[str] = Counter()
+        self.bash_commands: Counter[str] = Counter()
+        self.thinking_chars = 0
+        self.text_chars = 0
+        self.output_per_turn: list[int] = []
+        self.hourly = [0] * 24
+        self.daily: Counter[str] = Counter()
+        self.compactions = 0
+        self._last_ctx = 0
+        self.first_ts = ""
+        self.last_ts = ""
+        # subagents
+        self.sidechain_count = 0
+        self.sidechain_events: list[dict] = []  # refs into self.events, capped
+        self.agent_calls: list[dict] = []
+
+    def _clock(self, ts: str | None) -> None:
+        if not ts:
+            return
+        if not self.first_ts:
+            self.first_ts = ts
+        self.last_ts = ts
+        try:
+            self.hourly[int(ts[11:13])] += 1
+            self.daily[ts[:10]] += 1
+        except (ValueError, IndexError):
+            pass
+
+    def _track_sidechain(self, event: dict) -> None:
+        self.sidechain_count += 1
+        self.sidechain_events.append(event)
+        if len(self.sidechain_events) > 100:
+            self.sidechain_events.pop(0)
 
     def feed(self, rec: dict) -> None:
         message = rec.get("message")
@@ -337,17 +394,44 @@ class DetailBuilder:
 
         if role == "assistant":
             model = message.get("model")
-            blocks = [b for b in (_condense_block(b) for b in (message.get("content") or [])) if b]
-            for b in blocks:
-                if b["type"] == "tool_use":
-                    self.tool_counts[b["name"]] += 1
+            raw_blocks = message.get("content") or []
+            blocks = []
+            for raw in raw_blocks:
+                b = _condense_block(raw) if isinstance(raw, dict) else None
+                if not b:
+                    continue
+                blocks.append(b)
+                btype = b["type"]
+                if btype == "tool_use":
+                    name = b["name"]
+                    self.tool_counts[name] += 1
+                    if b.get("id"):
+                        self._tool_id_name[b["id"]] = name
+                    inp = raw.get("input") if isinstance(raw.get("input"), dict) else {}
+                    if name in _FILE_TOOLS:
+                        fp = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
+                        if fp:
+                            self.files_touched[str(fp)] += 1
+                    elif name == "Bash":
+                        cmd = str(inp.get("command", "")).strip()
+                        if cmd:
+                            self.bash_commands[cmd.split()[0][:40]] += 1
+                    elif name in ("Agent", "Task", "Workflow"):
+                        desc = inp.get("description") or inp.get("prompt") or ""
+                        self.agent_calls.append({"name": name, "desc": str(desc)[:160], "ts": ts})
+                        if len(self.agent_calls) > 100:
+                            self.agent_calls.pop(0)
+                elif btype == "thinking":
+                    self.thinking_chars += len(b.get("text", ""))
+                elif btype == "text":
+                    self.text_chars += len(b.get("text", ""))
 
             msg_id = message.get("id") or rec.get("requestId")
             last = self.events[-1] if self.events else None
             if last is not None and last.get("_merge_id") == msg_id and last["role"] == "assistant":
                 last["blocks"].extend(blocks)
             else:
-                self.events.append({
+                event = {
                     "uuid": rec.get("uuid"),
                     "role": "assistant",
                     "ts": ts,
@@ -355,52 +439,119 @@ class DetailBuilder:
                     "sidechain": is_side,
                     "blocks": blocks,
                     "_merge_id": msg_id,
-                })
+                }
+                self.events.append(event)
+                self._clock(ts)
+                if is_side:
+                    self._track_sidechain(event)
 
             if msg_id and msg_id not in self.seen_ids:
                 self.seen_ids.add(msg_id)
                 u = _extract_usage(message)
                 self.total.add(u)
                 self.by_model.setdefault(model or "unknown", pricing.Usage()).add(u)
+                self.output_per_turn.append(u.output)
                 ctx = _context_tokens(message)
-                if ctx and ts:
-                    cost = sum(pricing.cost_for(v, m) for m, v in self.by_model.items())
-                    self.timeline.append({"t": ts, "ctx": ctx, "cost": round(cost, 4)})
+                if ctx:
+                    if self._last_ctx and ctx < self._last_ctx * 0.65:
+                        self.compactions += 1
+                    self._last_ctx = ctx
+                    if ts:
+                        cost = sum(pricing.cost_for(v, m) for m, v in self.by_model.items())
+                        self.timeline.append({"t": ts, "ctx": ctx, "cost": round(cost, 4)})
 
         elif role == "user":
             content = message.get("content")
+            has_tool_result = False
             if isinstance(content, str):
                 blocks = [{"type": "text", "text": content[:TEXT_TRUNCATE], "truncated": len(content) > TEXT_TRUNCATE}]
             elif isinstance(content, list):
-                blocks = [b for b in (_condense_block(b) for b in content) if b]
+                blocks = []
+                for raw in content:
+                    b = _condense_block(raw) if isinstance(raw, dict) else None
+                    if not b:
+                        continue
+                    blocks.append(b)
+                    if b["type"] == "tool_result":
+                        has_tool_result = True
+                        if b.get("is_error"):
+                            self.tool_error_total += 1
+                            name = self._tool_id_name.get(b.get("tool_use_id") or "", "?")
+                            self.tool_errors[name] += 1
             else:
                 blocks = []
-            self.events.append({
+            if not has_tool_result:
+                self.user_prompts += 1
+            event = {
                 "uuid": rec.get("uuid"),
                 "role": "user",
                 "ts": ts,
                 "sidechain": is_side,
                 "blocks": blocks,
-            })
+            }
+            self.events.append(event)
+            self._clock(ts)
+            if is_side:
+                self._track_sidechain(event)
 
-    def result(self, *, max_events: int = 4000) -> dict:
-        truncated = len(self.events) > max_events
-        tail = self.events[-max_events:] if truncated else self.events
-        events = [{k: v for k, v in e.items() if k != "_merge_id"} for e in tail]
+    # -- output ------------------------------------------------------------- #
+
+    def meta(self) -> dict:
+        """Everything except transcript events — small, chart-ready payload."""
+        daily = sorted(self.daily.items())
         return {
-            "events": events,
-            "truncated": truncated,
+            "total_events": len(self.events),
             "usage": _usage_dict(self.total),
             "usage_by_model": {m: _usage_dict(u) for m, u in self.by_model.items()},
             "cost": round(sum(pricing.cost_for(u, m) for m, u in self.by_model.items()), 4),
             "tool_counts": dict(self.tool_counts.most_common()),
-            "timeline": list(self.timeline),
+            "timeline": _downsample(self.timeline),
+            "analytics": {
+                "user_prompts": self.user_prompts,
+                "assistant_turns": len(self.seen_ids),
+                "tool_calls": sum(self.tool_counts.values()),
+                "tool_error_total": self.tool_error_total,
+                "tool_errors": dict(self.tool_errors.most_common(10)),
+                "files_touched": dict(self.files_touched.most_common(15)),
+                "bash_commands": dict(self.bash_commands.most_common(12)),
+                "thinking_chars": self.thinking_chars,
+                "text_chars": self.text_chars,
+                "output_per_turn": _downsample(self.output_per_turn),
+                "hourly_utc": list(self.hourly),
+                "daily": daily[-30:],
+                "compactions": self.compactions,
+                "first_ts": self.first_ts,
+                "last_ts": self.last_ts,
+            },
+            "subagents": {
+                "count": self.sidechain_count,
+                "agent_calls": list(self.agent_calls),
+                "events": [_clean(e) for e in self.sidechain_events],
+            },
         }
 
+    def tail(self, count: int) -> tuple[list[dict], int]:
+        """Last `count` events; returns (events, global index of the first one)."""
+        tail = self.events[-count:] if count else []
+        start = len(self.events) - len(tail)
+        return [_clean(e) for e in tail], start
 
-def detail(path: Path, *, max_events: int = 4000) -> dict:
+    def page_before(self, before: int, count: int) -> tuple[list[dict], int]:
+        """Up to `count` events with global index < before."""
+        lo = max(0, before - count)
+        return [_clean(e) for e in self.events[lo:before]], lo
+
+    def page_after(self, after: int) -> tuple[list[dict], int]:
+        """All events with global index > after (used for live tail-follow)."""
+        start = after + 1
+        return [_clean(e) for e in self.events[start:]], start
+
+
+def detail(path: Path, *, tail: int = 4000) -> dict:
     """Convenience one-shot full parse (non-incremental callers/tests)."""
     b = DetailBuilder()
     for rec in iter_file_records(path):
         b.feed(rec)
-    return b.result(max_events=max_events)
+    out = b.meta()
+    out["events"], out["events_start"] = b.tail(tail)
+    return out

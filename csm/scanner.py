@@ -151,14 +151,15 @@ class Scanner:
                 return s.cwd
         return ""
 
-    # -- session detail (incremental) --------------------------------------- #
+    # -- session detail (incremental, paged) --------------------------------- #
 
-    def detail(self, jsonl: Path, *, max_events: int = 4000) -> dict:
+    def _detail_builder(self, jsonl: Path) -> DetailBuilder | None:
+        """Return the up-to-date incremental builder for a transcript."""
         key = str(jsonl)
         try:
             size = jsonl.stat().st_size
         except OSError:
-            return {"events": [], "error": "not found"}
+            return None
         state = self._detail_states.get(key)
         if state is None or state["offset"] > size:
             state = {"builder": DetailBuilder(), "offset": 0, "used": 0.0}
@@ -174,7 +175,30 @@ class Scanner:
                     del self._detail_states[oldest]
         state["offset"] = self._feed_lines(state["builder"], jsonl, state["offset"])
         state["used"] = time.time()
-        return state["builder"].result(max_events=max_events)
+        return state["builder"]
+
+    def detail(self, jsonl: Path, *, tail: int = 60) -> dict:
+        """Aggregates + the last `tail` transcript events (paged elsewhere)."""
+        b = self._detail_builder(jsonl)
+        if b is None:
+            return {"events": [], "error": "not found"}
+        out = b.meta()
+        out["events"], out["events_start"] = b.tail(tail)
+        return out
+
+    def transcript_before(self, jsonl: Path, before: int, count: int) -> dict:
+        b = self._detail_builder(jsonl)
+        if b is None:
+            return {"events": [], "start": 0}
+        events, start = b.page_before(before, count)
+        return {"events": events, "start": start, "total": len(b.events)}
+
+    def transcript_after(self, jsonl: Path, after: int) -> dict:
+        b = self._detail_builder(jsonl)
+        if b is None:
+            return {"events": [], "start": 0}
+        events, start = b.page_after(after)
+        return {"events": events, "start": start, "total": len(b.events)}
 
     # -- memory ------------------------------------------------------------- #
 
