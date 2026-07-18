@@ -69,9 +69,8 @@ body {
 }
 .brand { display: flex; align-items: center; gap: 9px; min-width: 210px; }
 .brand-mark {
-  width: 16px; height: 16px; border-radius: 5px;
-  background: linear-gradient(135deg, var(--accent), #e0956f);
-  box-shadow: 0 0 14px rgba(217, 119, 87, 0.5);
+  width: 18px; height: 18px; display: block;
+  filter: drop-shadow(0 0 8px rgba(217, 119, 87, 0.45));
 }
 .brand-name { font-weight: 650; letter-spacing: -0.2px; font-size: 14px; }
 .brand-thin { color: var(--text-dim); font-weight: 400; }

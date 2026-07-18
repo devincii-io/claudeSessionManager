@@ -43,7 +43,7 @@ def _prepare_native_env() -> None:
 _prepare_native_env()
 
 from PySide6.QtCore import QCoreApplication, Qt, QUrl
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -54,6 +54,17 @@ from .scanner import Scanner
 from .watcher import Watcher
 
 APP_NAME = "Claude Session Manager"
+
+
+def app_icon() -> QIcon:
+    """Multi-resolution application icon (taskbar, alt-tab, window)."""
+    icon = QIcon()
+    icons = asset_dir() / "icons"
+    for size in (16, 24, 32, 48, 64, 128, 256, 512):
+        f = icons / f"app-{size}.png"
+        if f.is_file():
+            icon.addFile(str(f))
+    return icon
 
 
 def asset_dir() -> Path:
@@ -111,6 +122,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("claude-session-manager")
+    app.setWindowIcon(app_icon())
 
     palette = app.palette()
     palette.setColor(QPalette.ColorRole.Window, QColor("#1b1a17"))

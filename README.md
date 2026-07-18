@@ -1,3 +1,5 @@
+<p align="center"><img src="web/icons/app-128.png" alt="Claude Session Manager" width="96"></p>
+
 # Claude Session Manager
 
 > **Unofficial community tool** — not affiliated with, or endorsed by, Anthropic.
@@ -93,6 +95,7 @@ or `uv run python -m csm.app`.
 ```bash
 uv sync --extra build
 uv run pyinstaller --noconfirm --windowed --name ClaudeSessionManager \
+  --icon web/icons/app.ico \
   --add-data "web:web" launcher.py    # use "web;web" on Windows
 ```
 
