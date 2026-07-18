@@ -99,6 +99,10 @@ class Bridge(QObject):
     def getShells(self) -> str:
         return _j(self._scanner.get_shells())
 
+    @Slot(result=str)
+    def getGlobalStats(self) -> str:
+        return _j(self._scanner.global_stats())
+
     @Slot(str, result=str)
     def getMemory(self, project_id: str) -> str:
         return _j(self._scanner.get_memory(project_id))

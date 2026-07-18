@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 
-from . import paths
+from . import paths, pricing
 from .session_parser import (
     DetailBuilder,
     SessionSummary,
@@ -339,6 +341,75 @@ class Scanner:
                 envs.append({"session_id": d.name, "path": str(d), "mtime": mtime})
             envs.sort(key=lambda x: x["mtime"], reverse=True)
         return {"snapshots": snaps[:20], "envs": envs[:20]}
+
+    # -- global stats (all sessions, all projects) --------------------------- #
+
+    def global_stats(self) -> dict:
+        """Aggregate analytics across every session on the machine.
+
+        Reads only cached summaries (cheap after the first scan)."""
+        root = paths.projects_dir()
+        totals = pricing.Usage()
+        by_model: dict[str, pricing.Usage] = {}
+        tools: Counter[str] = Counter()
+        days: Counter[str] = Counter()
+        cost = 0.0
+        sessions = active = prompts = turns = tool_calls = subagent_sessions = 0
+        now = time.time()
+        if root.is_dir():
+            for pdir in root.iterdir():
+                if not pdir.is_dir():
+                    continue
+                for f in pdir.glob("*.jsonl"):
+                    s = self._summary(f)
+                    sessions += 1
+                    cost += s.cost
+                    prompts += s.user_messages
+                    turns += s.assistant_messages
+                    tool_calls += s.tool_calls
+                    if s.has_subagents:
+                        subagent_sessions += 1
+                    if now - s.mtime <= ACTIVE_WINDOW_SECONDS:
+                        active += 1
+                    u = s.usage or {}
+                    totals.add(pricing.Usage(
+                        input=u.get("input", 0), output=u.get("output", 0),
+                        cache_read=u.get("cache_read", 0), cache_write=u.get("cache_write", 0)))
+                    for m, ud in (s.usage_by_model or {}).items():
+                        if m in ("unknown", "<synthetic>"):
+                            continue
+                        bm = by_model.setdefault(m, pricing.Usage())
+                        bm.add(pricing.Usage(
+                            input=ud.get("input", 0), output=ud.get("output", 0),
+                            cache_read=ud.get("cache_read", 0), cache_write=ud.get("cache_write", 0)))
+                    for name, c in (s.tool_counts or {}).items():
+                        tools[name] += c
+                    if s.mtime:
+                        days[time.strftime("%Y-%m-%d", time.localtime(s.mtime))] += 1
+        self._save_cache()
+        # last 14 calendar days, zero-filled
+        by_day = []
+        for i in range(13, -1, -1):
+            d = time.strftime("%Y-%m-%d", time.localtime(now - i * 86400))
+            by_day.append([d, days.get(d, 0)])
+        usage_total = asdict(totals)
+        usage_total["total"] = totals.total
+        return {
+            "cost": round(cost, 4),
+            "usage": usage_total,
+            "sessions": sessions,
+            "active": active,
+            "prompts": prompts,
+            "turns": turns,
+            "tool_calls": tool_calls,
+            "subagent_sessions": subagent_sessions,
+            "by_model": {
+                m: {**asdict(u), "total": u.total, "cost": round(pricing.cost_for(u, m), 4)}
+                for m, u in by_model.items()
+            },
+            "tool_counts": dict(tools.most_common(14)),
+            "sessions_by_day": by_day,
+        }
 
     # -- global search ------------------------------------------------------- #
 

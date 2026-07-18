@@ -223,6 +223,8 @@ body {
 /* ---------- Cards / sections ---------- */
 .section { margin-bottom: 22px; }
 .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--text-faint); font-weight: 600; margin-bottom: 11px; display: flex; align-items: center; justify-content: space-between; }
+.section-desc { font-size: 11.5px; color: var(--text-faint); margin: -7px 0 10px; line-height: 1.45; max-width: 760px; }
+.tile[title] { cursor: help; }
 .card { background: var(--bg-2); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 16px; }
 
 .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 20px; }

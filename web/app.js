@@ -101,8 +101,13 @@ function meterRow(label, pct, valText) {
   return `<div class="meter-row"><span class="m-label">${esc(label)}</span>${meter(pct)}<span class="m-val">${esc(valText != null ? valText : pct.toFixed(0) + "%")}</span></div>`;
 }
 
-function tile(label, value, sub, accent) {
-  return `<div class="tile ${accent ? "accent" : ""}"><div class="t-label">${esc(label)}</div><div class="t-value">${value}</div>${sub ? `<div class="t-sub">${esc(sub)}</div>` : ""}</div>`;
+function tile(label, value, sub, accent, tip) {
+  return `<div class="tile ${accent ? "accent" : ""}" ${tip ? `title="${esc(tip)}"` : ""}><div class="t-label">${esc(label)}</div><div class="t-value">${value}</div>${sub ? `<div class="t-sub">${esc(sub)}</div>` : ""}</div>`;
+}
+
+/* Muted one-line explanation under a section title. */
+function desc(text) {
+  return `<div class="section-desc">${esc(text)}</div>`;
 }
 
 function barChart(items) {
@@ -177,26 +182,15 @@ function renderRail() {
 
 function renderListPane() {
   const el = document.getElementById("list-pane");
+  // The rail already lists projects — the middle pane only appears inside a
+  // project (sessions + memory) so information is never shown twice.
   if (State.projectId) {
     el.style.display = "flex";
     el.innerHTML = projectListPane();
-  } else if (State.view === "overview") {
-    el.style.display = "flex";
-    el.innerHTML = overviewListPane();
   } else {
     el.style.display = "none";
     el.innerHTML = "";
   }
-}
-
-function overviewListPane() {
-  const ranked = [...State.projects].sort((a, b) => b.total_cost - a.total_cost);
-  return `<div class="list-head"><h2>Projects</h2><div class="sub">${State.projects.length} tracked · ranked by spend</div></div>
-    <div class="list-body">${ranked.map((p) => `
-      <div class="session-card" data-action="project" data-id="${esc(p.id)}">
-        <div class="sc-title">${p.active_count ? '<span class="dot-active"></span> ' : ""}${esc(p.name)}</div>
-        <div class="sc-meta"><b>${p.session_count}</b> sessions <b>${fmt.cost(p.total_cost)}</b> <b>${fmt.tokens(p.total_tokens)}</b> tok · ${fmt.rel(p.last_activity)}</div>
-      </div>`).join("")}</div>`;
 }
 
 function projectListPane() {
@@ -298,27 +292,65 @@ async function runGlobalSearch(q) {
 
 function overviewView() {
   const P = State.projects;
-  const totalCost = P.reduce((a, b) => a + b.total_cost, 0);
-  const totalTokens = P.reduce((a, b) => a + b.total_tokens, 0);
-  const totalSessions = P.reduce((a, b) => a + b.session_count, 0);
-  const active = P.reduce((a, b) => a + b.active_count, 0);
+  const g = State.globalStats;
+  if (!g) return `<div class="detail-inner"><div class="skeleton">Aggregating all sessions…</div></div>`;
+  const u = g.usage || {};
+  const ctxTotal = (u.input || 0) + (u.cache_read || 0) + (u.cache_write || 0);
+  const cacheHit = ctxTotal ? (100 * (u.cache_read || 0) / ctxTotal) : 0;
 
   const costBars = [...P].sort((a, b) => b.total_cost - a.total_cost).slice(0, 8).map((p, i) => ({
     label: p.name, value: p.total_cost, valueText: fmt.cost(p.total_cost), color: CHART_PALETTE[i % CHART_PALETTE.length],
   }));
+  const models = Object.entries(g.by_model || {}).filter(([, v]) => (v.total || 0) > 0)
+    .sort((a, b) => b[1].cost - a[1].cost);
+  const donutItems = models.map(([m, v], i) => ({ label: shortModel(m), value: v.total, color: modelColor(m, i) }));
+  const toolBars = Object.entries(g.tool_counts || {}).slice(0, 12)
+    .map(([name, n]) => ({ label: name, value: n, valueText: fmt.num(n) }));
+  const dayVals = (g.sessions_by_day || []).map(([, n]) => n);
+  const dayLabels = (g.sessions_by_day || []).map(([d]) => d.slice(8));
 
   return `<div class="detail-inner">
-    <div class="page-head"><div><h1>Overview</h1><div class="ph-sub">All Claude Code activity on this machine</div></div>
-      <div class="page-actions"><button class="btn sm" data-action="open-home">Open ~/.claude</button></div></div>
+    <div class="page-head"><div><h1>Overview</h1><div class="ph-sub">Everything Claude Code has done on this machine — all projects, all sessions</div></div>
+      <div class="page-actions"><button class="btn sm" data-action="open-home" title="Open the Claude data folder in your file manager">Open ~/.claude</button></div></div>
     <div class="tiles">
-      ${tile("Total spend", fmt.cost(totalCost), "estimated", true)}
-      ${tile("Tokens", fmt.tokens(totalTokens), "all sessions")}
-      ${tile("Sessions", totalSessions, P.length + " projects")}
-      ${tile("Active now", active, "live sessions")}
+      ${tile("Total spend", fmt.cost(g.cost), fmt.cost(g.sessions ? g.cost / g.sessions : 0) + " avg / session", true,
+        "Estimated from per-model token usage and list prices (cache reads ~0.1x, cache writes ~1.25x input price)")}
+      ${tile("Tokens", fmt.tokens(u.total), fmt.tokens(u.output) + " generated",
+        false, "All tokens across every session: input + output + cache reads/writes")}
+      ${tile("Cache hit rate", cacheHit.toFixed(0) + "%", fmt.tokens(u.cache_read) + " served from cache",
+        false, "Share of context tokens served from the prompt cache — cache reads cost ~10x less than fresh input")}
+      ${tile("Sessions", g.sessions, g.active + " live · " + P.length + " projects",
+        false, "Every transcript under ~/.claude/projects; live = written to in the last 2 minutes")}
+    </div>
+    <div class="tiles">
+      ${tile("Prompts", fmt.num(g.prompts), "messages you sent", false, "User messages across all sessions (tool results excluded)")}
+      ${tile("Assistant turns", fmt.num(g.turns), "API responses", false, "Deduplicated assistant responses across all sessions")}
+      ${tile("Tool calls", fmt.num(g.tool_calls), Object.keys(g.tool_counts || {}).length + " distinct tools",
+        false, "Bash, Edit, Read, subagents… every tool invocation Claude made")}
+      ${tile("Subagent sessions", g.subagent_sessions, "used Agent/Task", false, "Sessions that spawned subagents or used the Agent/Task tools")}
     </div>
     <div class="section"><div class="section-title">Spend by project</div>
+      ${desc("Estimated cost of every session, grouped by the project it ran in.")}
       <div class="card">${costBars.length ? barChart(costBars) : '<div class="faint">No data.</div>'}</div></div>
-    <div id="ov-statusline"></div>
+    ${donutItems.length ? `<div class="section"><div class="section-title">Models — tokens & cost</div>
+      ${desc("Which models did the work, and what each one cost across all sessions.")}
+      <div class="card"><div style="display:flex;gap:28px;align-items:center;flex-wrap:wrap">${donut(donutItems)}
+        <div class="legend">${models.map(([m, v], i) => `<div class="legend-item"><span class="legend-swatch" style="background:${modelColor(m, i)}"></span>${esc(shortModel(m))} <b style="color:var(--text)">${fmt.cost(v.cost)}</b> <span class="faint">${fmt.tokens(v.total)} tok</span></div>`).join("")}</div>
+      </div></div></div>` : ""}
+    <div class="section"><div class="section-title">Activity — last 14 days</div>
+      ${desc("Sessions with activity per day (by last write to the transcript).")}
+      <div class="card">${columns(dayVals, "#7aa2c9", dayLabels)}</div></div>
+    ${toolBars.length ? `<div class="section"><div class="section-title">Tool usage — all sessions</div>
+      ${desc("Total invocations per tool across every session on this machine.")}
+      <div class="card">${barChart(toolBars)}</div></div>` : ""}
+    <div class="section"><div class="section-title">Token composition</div>
+      ${desc("Where all those tokens went. Cache reads are re-served context (cheap); cache writes populate the cache (~1.25x input price).")}
+      <div class="card">${barChart([
+        { label: "Input", value: u.input || 0, valueText: fmt.tokens(u.input), color: "#7aa2c9" },
+        { label: "Output", value: u.output || 0, valueText: fmt.tokens(u.output), color: "#d97757" },
+        { label: "Cache write", value: u.cache_write || 0, valueText: fmt.tokens(u.cache_write), color: "#e0b64c" },
+        { label: "Cache read", value: u.cache_read || 0, valueText: fmt.tokens(u.cache_read), color: "#7fae6f" },
+      ])}</div></div>
   </div>`;
 }
 
@@ -509,16 +541,24 @@ function analyticsTab(d) {
   const errRate = a.tool_calls ? (100 * a.tool_error_total / a.tool_calls) : 0;
 
   return `<div class="tiles">
-      ${tile("Cost", fmt.cost(d.cost), "$" + (d.cost / turns).toFixed(3) + " / turn", true)}
-      ${tile("Total tokens", fmt.tokens(u.total), fmt.tokens(Math.round((u.output || 0) / turns)) + " out / turn")}
-      ${tile("Cache hit rate", cacheHit.toFixed(0) + "%", fmt.tokens(u.cache_read) + " read")}
-      ${tile("Duration", durationText(a.first_ts, a.last_ts), (a.user_prompts || 0) + " prompts · " + turns + " turns")}
+      ${tile("Cost", fmt.cost(d.cost), "$" + (d.cost / turns).toFixed(3) + " / turn", true,
+        "Estimated from this session's per-model token usage at list prices")}
+      ${tile("Total tokens", fmt.tokens(u.total), fmt.tokens(Math.round((u.output || 0) / turns)) + " out / turn",
+        false, "Input + output + cache reads/writes for this session")}
+      ${tile("Cache hit rate", cacheHit.toFixed(0) + "%", fmt.tokens(u.cache_read) + " read",
+        false, "Share of context served from the prompt cache — cached context costs ~10x less than fresh input")}
+      ${tile("Duration", durationText(a.first_ts, a.last_ts), (a.user_prompts || 0) + " prompts · " + turns + " turns",
+        false, "Wall-clock time from the first to the last message")}
     </div>
     <div class="tiles">
-      ${tile("Tool calls", fmt.num(a.tool_calls), Object.keys(d.tool_counts || {}).length + " distinct tools")}
-      ${tile("Tool errors", a.tool_error_total || 0, errRate.toFixed(1) + "% error rate")}
-      ${tile("Compactions", a.compactions || 0, "context resets")}
-      ${tile("Thinking share", thinkShare.toFixed(0) + "%", "of generated text")}
+      ${tile("Tool calls", fmt.num(a.tool_calls), Object.keys(d.tool_counts || {}).length + " distinct tools",
+        false, "Every Bash, Edit, Read, Agent… invocation Claude made in this session")}
+      ${tile("Tool errors", a.tool_error_total || 0, errRate.toFixed(1) + "% error rate",
+        false, "Tool results that came back as errors (failed commands, bad edits…)")}
+      ${tile("Compactions", a.compactions || 0, "context resets",
+        false, "Times the conversation was compacted/summarized to free context — the context meter drops sharply at each one")}
+      ${tile("Thinking share", thinkShare.toFixed(0) + "%", "of generated text",
+        false, "How much of Claude's generated text was internal reasoning rather than visible replies")}
     </div>
     <div class="section"><div class="section-title">Token composition</div><div class="card">
       ${barChart([
@@ -748,10 +788,13 @@ function monitorView() {
   const snaps = shells.snapshots || [];
   const envs = shells.envs || [];
   return `<div class="detail-inner">
-    <div class="page-head"><div><h1>Monitor</h1><div class="ph-sub">Live sessions, shells and context pressure</div></div>
+    <div class="page-head"><div><h1>Monitor</h1><div class="ph-sub">What Claude Code is doing right now (spend & totals live on Overview)</div></div>
       <div class="page-actions"><button class="btn sm" data-action="refresh">Refresh</button></div></div>
-    ${live ? `<div class="section"><div class="section-title">Live statusline</div><div class="card">${liveStatuslinePanel(live)}</div></div>` : ""}
+    ${live ? `<div class="section"><div class="section-title">Live statusline</div>
+      ${desc("The exact context and rate-limit payload Claude Code last handed to your statusline command — the same numbers your terminal statusline shows.")}
+      <div class="card">${liveStatuslinePanel(live)}</div></div>` : ""}
     <div class="section"><div class="section-title">Active projects (${active.length})</div>
+      ${desc("Projects whose session transcripts were written to in the last 2 minutes — i.e. Claude is (or just was) working there.")}
       <div class="card">${active.length ? active.map((p) => `
         <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border-soft)">
           <span class="dot-active"></span><b>${esc(p.name)}</b>
@@ -759,6 +802,7 @@ function monitorView() {
           <span style="margin-left:auto" class="p-cost">${fmt.cost(p.total_cost)}</span></div>`).join("")
         : '<div class="faint" style="font-size:12px">No sessions active in the last 2 minutes.</div>'}</div></div>
     <div class="section"><div class="section-title">Shell snapshots (${snaps.length})</div>
+      ${desc("When a session starts, Claude Code snapshots your shell profile (aliases, functions, PATH) and sources it for every Bash tool call — these are those snapshot scripts.")}
       <div class="card">${snaps.length ? snaps.map((f) => `
         <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border-soft);font-size:12px">
           <span class="mono dim">${esc(f.name)}</span>
@@ -766,17 +810,13 @@ function monitorView() {
           <button class="btn sm" data-action="cfg-view" data-path="${esc(f.path)}">View</button></div>`).join("")
         : '<div class="faint" style="font-size:12px">No shell snapshots.</div>'}</div></div>
     <div class="section"><div class="section-title">Session environments (${envs.length})</div>
+      ${desc("Per-session working state kept under ~/.claude/session-env so a session can be resumed. Purged automatically with the session; the Delete button's purge option also removes them.")}
       <div class="card">${envs.length ? envs.map((e) => `
         <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border-soft);font-size:12px">
           <span class="mono dim">${esc(e.session_id)}</span>
           <span class="faint" style="margin-left:auto;font-size:11px">${fmt.rel(e.mtime)}</span>
           <button class="btn sm" data-action="open-folder" data-path="${esc(e.path)}">Open</button></div>`).join("")
         : '<div class="faint" style="font-size:12px">No session environments.</div>'}</div></div>
-    <div class="section"><div class="section-title">All projects — spend</div>
-      <div class="card chart-bars">${State.projects.map((p) => `
-        <div class="bar-row"><span class="bar-label">${esc(p.name)}</span>
-          <span>${meterRow("", Math.min(100, p.total_cost), fmt.cost(p.total_cost))}</span>
-          <span class="bar-val">${p.session_count}s</span></div>`).join("")}</div></div>
   </div>`;
 }
 
@@ -792,6 +832,9 @@ async function loadOverview() {
   const o = await call("getOverview");
   if (o) { State.projects = o.projects || []; State.claudeHome = o.home; }
   renderRail();
+  // Global aggregates power the Overview dashboard; refresh alongside.
+  const g = await call("getGlobalStats");
+  if (g) { State.globalStats = g; if (State.view === "overview" && !State.projectId) renderDetail(); }
 }
 
 async function selectProject(id, { keepSession = false } = {}) {
