@@ -45,6 +45,7 @@ _prepare_native_env()
 from PySide6.QtCore import QCoreApplication, Qt, QUrl
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QMainWindow
 
@@ -85,6 +86,9 @@ class MainWindow(QMainWindow):
 
         self._view = QWebEngineView(self)
         self._view.page().setBackgroundColor(QColor("#1b1a17"))
+        ws = self._view.settings()
+        ws.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True)
+        ws.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         self.setCentralWidget(self._view)
 
         self._channel = QWebChannel(self._view.page())

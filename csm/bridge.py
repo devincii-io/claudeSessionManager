@@ -13,7 +13,6 @@ from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from . import actions, paths
 from .scanner import Scanner
-from .session_parser import detail
 from .watcher import Watcher
 
 
@@ -29,6 +28,7 @@ class Bridge(QObject):
         self._scanner = scanner
         self._watcher = watcher
         self._open_session: tuple[str, str] | None = None
+        self._pending_reason: str | None = None
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -39,10 +39,19 @@ class Bridge(QObject):
     # -- filesystem → UI ---------------------------------------------------- #
 
     def _on_fs_event(self, path: str) -> None:
+        # Statusline capture rewrites constantly while Claude runs; route it as
+        # a cheap "statusline" tick so the UI doesn't do a full data refresh.
+        if path.endswith(".csm-statusline.json"):
+            if self._pending_reason is None:
+                self._pending_reason = "statusline"
+        else:
+            self._pending_reason = "fs"
         self._debounce.start()
 
     def _flush(self) -> None:
-        self.dataChanged.emit("fs")
+        reason = self._pending_reason or "fs"
+        self._pending_reason = None
+        self.dataChanged.emit(reason)
 
     # -- read slots --------------------------------------------------------- #
 
@@ -58,16 +67,26 @@ class Bridge(QObject):
     def getSessionDetail(self, project_id: str, session_id: str) -> str:
         project_path = self._scanner.project_path(project_id)
         jsonl = paths.projects_dir() / project_id / f"{session_id}.jsonl"
-        data = detail(jsonl) if jsonl.is_file() else {"events": [], "error": "not found"}
+        data = self._scanner.detail(jsonl) if jsonl.is_file() else {"events": [], "error": "not found"}
         data["tasks"] = self._scanner.get_tasks(session_id)
         scratch = self._scanner.get_scratchpad(project_path, session_id)
         data["scratchpad"] = scratch
+        data["images"] = self._scanner.get_images(session_id)
+        data["file_history"] = self._scanner.get_file_history(session_id)
         data["session_id"] = session_id
         data["project_id"] = project_id
-        # Live-watch this session's scratchpad while it's open.
+        # Live-watch this session's workspace while it's open.
         self._open_session = (project_id, session_id)
         self._watcher.watch_scratchpad(scratch.get("dir") or None)
         return _j(data)
+
+    @Slot(str, result=str)
+    def searchAll(self, query: str) -> str:
+        return _j(self._scanner.search_all(query))
+
+    @Slot(result=str)
+    def getShells(self) -> str:
+        return _j(self._scanner.get_shells())
 
     @Slot(str, result=str)
     def getMemory(self, project_id: str) -> str:
