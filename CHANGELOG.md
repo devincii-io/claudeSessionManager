@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-07-18
+
+### Added
+- **All-sessions Overview dashboard**: global spend (+avg/session), tokens,
+  cache hit rate, prompts/turns/tool calls, subagent sessions, per-model cost,
+  14-day activity, machine-wide tool usage and token composition.
+- Application logo and icons — window/taskbar icon, Windows exe icon, favicon,
+  in-app brand and README, all rendered from one SVG master.
+- In-app minimize/close controls (WSLg title bars are nearly invisible).
+- Per-model cost in the session model legend.
+- PyInstaller entry point (`launcher.py`) and prebuilt release artifacts for
+  Windows and Linux.
+
+### Changed
+- Monitor shows live state only (duplicated spend section removed) and every
+  section/stat carries a plain-language explanation of what it is.
+- The middle pane appears only inside a project — no duplicated project list.
+
+### Fixed
+- The filesystem watcher no longer crashes startup on unwatchable homes
+  (e.g. UNC paths on Windows).
+
 ## [0.3.0] — 2026-07-18
 
 ### Changed
