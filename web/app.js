@@ -529,7 +529,7 @@ function analyticsTab(d) {
       ])}</div></div>
     ${donutItems.length ? `<div class="section"><div class="section-title">Tokens by model</div><div class="card">
       <div style="display:flex;gap:28px;align-items:center;flex-wrap:wrap">${donut(donutItems)}
-      <div class="legend">${costByModel.map(([m, v], i) => `<div class="legend-item"><span class="legend-swatch" style="background:${modelColor(m, i)}"></span>${esc(shortModel(m))} <b style="color:var(--text)">${fmt.tokens(v.total)}</b> <span class="faint">(${fmt.tokens(v.output)} out)</span></div>`).join("")}</div></div></div></div>` : ""}
+      <div class="legend">${costByModel.map(([m, v], i) => `<div class="legend-item"><span class="legend-swatch" style="background:${modelColor(m, i)}"></span>${esc(shortModel(m))} <b style="color:var(--text)">${fmt.cost(v.cost)}</b> <span class="faint">${fmt.tokens(v.total)} tok · ${fmt.tokens(v.output)} out</span></div>`).join("")}</div></div></div></div>` : ""}
     <div class="section"><div class="section-title">Context window over time · ${a.compactions || 0} compaction${(a.compactions || 0) === 1 ? "" : "s"}</div><div class="card">${sparkline(ctxPoints, "#7aa2c9")}</div></div>
     <div class="section"><div class="section-title">Cumulative cost</div><div class="card">${sparkline(costPoints, "#d97757")}</div></div>
     ${outPoints.length > 1 ? `<div class="section"><div class="section-title">Output tokens per turn</div><div class="card">${sparkline(outPoints, "#7fae6f")}</div></div>` : ""}

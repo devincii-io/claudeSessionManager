@@ -499,10 +499,15 @@ class DetailBuilder:
     def meta(self) -> dict:
         """Everything except transcript events — small, chart-ready payload."""
         daily = sorted(self.daily.items())
+        by_model = {}
+        for m, u in self.by_model.items():
+            d = _usage_dict(u)
+            d["cost"] = round(pricing.cost_for(u, m), 4)
+            by_model[m] = d
         return {
             "total_events": len(self.events),
             "usage": _usage_dict(self.total),
-            "usage_by_model": {m: _usage_dict(u) for m, u in self.by_model.items()},
+            "usage_by_model": by_model,
             "cost": round(sum(pricing.cost_for(u, m) for m, u in self.by_model.items()), 4),
             "tool_counts": dict(self.tool_counts.most_common()),
             "timeline": _downsample(self.timeline),
