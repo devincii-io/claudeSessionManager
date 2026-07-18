@@ -1,9 +1,13 @@
 """Enumerate Claude Code's on-disk state: projects, sessions, memory, tasks,
-scratchpads, settings and the optional live statusline capture.
+scratchpads, images, shells, settings and the optional live statusline capture.
 
-Session summaries are the expensive part (a full pass over each ``.jsonl``), so
-they are cached on disk keyed by file mtime+size and only recomputed when a file
-changes. Everything else is cheap directory reads.
+Performance:
+
+* Session summaries persist in a disk cache keyed by mtime+size.
+* For files that change while the app runs, an in-memory *incremental* builder
+  (byte offset + aggregates) parses only appended bytes — live sessions cost
+  microseconds per refresh instead of a full re-parse.
+* The opened session's transcript uses the same incremental scheme.
 """
 
 from __future__ import annotations
@@ -12,17 +16,29 @@ import json
 import time
 from pathlib import Path
 
-from . import paths, pricing
-from .session_parser import SessionSummary, summarize
+from . import paths
+from .session_parser import (
+    DetailBuilder,
+    SessionSummary,
+    SummaryBuilder,
+    _loads,
+    read_new_lines,
+)
 
 ACTIVE_WINDOW_SECONDS = 120  # a session whose jsonl changed this recently is "live"
 CACHE_VERSION = 2  # bump when SessionSummary's schema or computation changes
+MAX_DETAIL_STATES = 4  # incremental transcript states kept in memory
 
 
 class Scanner:
     def __init__(self) -> None:
         self._cache_path = paths.cache_dir() / "summaries.json"
         self._cache: dict[str, dict] = {}
+        self._cache_dirty = False
+        # path -> {"builder": SummaryBuilder, "offset": int}
+        self._sum_states: dict[str, dict] = {}
+        # path -> {"builder": DetailBuilder, "offset": int, "used": float}
+        self._detail_states: dict[str, dict] = {}
         self._load_cache()
 
     # -- summary cache ------------------------------------------------------ #
@@ -30,18 +46,30 @@ class Scanner:
     def _load_cache(self) -> None:
         try:
             blob = json.loads(self._cache_path.read_text("utf-8"))
-            if blob.get("_v") == CACHE_VERSION:
-                self._cache = blob.get("entries", {})
-            else:
-                self._cache = {}
+            self._cache = blob.get("entries", {}) if blob.get("_v") == CACHE_VERSION else {}
         except (OSError, json.JSONDecodeError, AttributeError):
             self._cache = {}
 
     def _save_cache(self) -> None:
+        if not self._cache_dirty:
+            return
         try:
             self._cache_path.write_text(json.dumps({"_v": CACHE_VERSION, "entries": self._cache}), "utf-8")
+            self._cache_dirty = False
         except OSError:
             pass
+
+    def _feed_lines(self, builder, path: Path, offset: int) -> int:
+        lines, new_offset = read_new_lines(path, offset)
+        feed = builder.feed
+        for line in lines:
+            if not line:
+                continue
+            try:
+                feed(_loads(line))
+            except Exception:
+                continue
+        return new_offset
 
     def _summary(self, jsonl: Path) -> SessionSummary:
         try:
@@ -52,8 +80,15 @@ class Scanner:
         cached = self._cache.get(key)
         if cached and cached.get("size_bytes") == st.st_size and cached.get("mtime") == st.st_mtime:
             return SessionSummary(**cached)
-        summary = summarize(jsonl, size=st.st_size, mtime=st.st_mtime)
+
+        state = self._sum_states.get(key)
+        if state is None or state["offset"] > st.st_size:  # new or truncated/rewritten
+            state = {"builder": SummaryBuilder(), "offset": 0}
+            self._sum_states[key] = state
+        state["offset"] = self._feed_lines(state["builder"], jsonl, state["offset"])
+        summary = state["builder"].result(jsonl.stem, key, st.st_size, st.st_mtime)
         self._cache[key] = summary.to_dict()
+        self._cache_dirty = True
         return summary
 
     # -- projects & sessions ------------------------------------------------ #
@@ -116,6 +151,31 @@ class Scanner:
                 return s.cwd
         return ""
 
+    # -- session detail (incremental) --------------------------------------- #
+
+    def detail(self, jsonl: Path, *, max_events: int = 4000) -> dict:
+        key = str(jsonl)
+        try:
+            size = jsonl.stat().st_size
+        except OSError:
+            return {"events": [], "error": "not found"}
+        state = self._detail_states.get(key)
+        if state is None or state["offset"] > size:
+            state = {"builder": DetailBuilder(), "offset": 0, "used": 0.0}
+            self._detail_states[key] = state
+            # Evict least-recently-used states beyond the cap.
+            if len(self._detail_states) > MAX_DETAIL_STATES:
+                oldest = min(
+                    (k for k in self._detail_states if k != key),
+                    key=lambda k: self._detail_states[k]["used"],
+                    default=None,
+                )
+                if oldest:
+                    del self._detail_states[oldest]
+        state["offset"] = self._feed_lines(state["builder"], jsonl, state["offset"])
+        state["used"] = time.time()
+        return state["builder"].result(max_events=max_events)
+
     # -- memory ------------------------------------------------------------- #
 
     def get_memory(self, project_id: str) -> dict:
@@ -165,15 +225,15 @@ class Scanner:
         tasks.sort(key=lambda t: str(t.get("id", "")))
         return tasks
 
-    # -- scratchpad --------------------------------------------------------- #
+    # -- workspace (scratchpad + background task outputs) ------------------- #
 
     def get_scratchpad(self, project_path: str, session_id: str) -> dict:
-        sp = paths.scratchpad_dir(project_path, session_id)
-        result = {"dir": str(sp) if sp else "", "exists": bool(sp), "files": []}
-        if not sp:
+        base = paths.session_tmp_dir(project_path, session_id)
+        result = {"dir": str(base) if base else "", "exists": bool(base), "files": []}
+        if not base:
             return result
         files = []
-        for f in sorted(sp.rglob("*")):
+        for f in base.rglob("*"):
             if f.is_dir() or "__pycache__" in f.parts:
                 continue
             try:
@@ -182,7 +242,7 @@ class Scanner:
                 continue
             files.append(
                 {
-                    "name": str(f.relative_to(sp)),
+                    "name": str(f.relative_to(base)),
                     "path": str(f),
                     "size": st.st_size,
                     "mtime": st.st_mtime,
@@ -192,6 +252,121 @@ class Scanner:
         files.sort(key=lambda x: x["mtime"], reverse=True)
         result["files"] = files
         return result
+
+    # -- images ------------------------------------------------------------- #
+
+    def get_images(self, session_id: str) -> list[dict]:
+        d = paths.image_cache_dir(session_id)
+        if not d.is_dir():
+            return []
+        out = []
+        for f in sorted(d.iterdir()):
+            if f.suffix.lower() not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            out.append({"name": f.name, "path": str(f), "size": st.st_size, "mtime": st.st_mtime})
+        return out
+
+    # -- file history ------------------------------------------------------- #
+
+    def get_file_history(self, session_id: str) -> dict:
+        d = paths.file_history_dir(session_id)
+        count = 0
+        total = 0
+        if d.is_dir():
+            for f in d.iterdir():
+                if f.is_file():
+                    count += 1
+                    try:
+                        total += f.stat().st_size
+                    except OSError:
+                        pass
+        return {"dir": str(d), "count": count, "bytes": total}
+
+    # -- shells & environments (monitor) ------------------------------------ #
+
+    def get_shells(self) -> dict:
+        home = paths.claude_home()
+        snaps = []
+        sdir = paths.shell_snapshots_dir()
+        if sdir.is_dir():
+            for f in sdir.iterdir():
+                if not f.is_file():
+                    continue
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                snaps.append({"name": f.name, "path": str(f), "size": st.st_size, "mtime": st.st_mtime})
+            snaps.sort(key=lambda x: x["mtime"], reverse=True)
+        envs = []
+        edir = home / "session-env"
+        if edir.is_dir():
+            for d in edir.iterdir():
+                if not d.is_dir():
+                    continue
+                try:
+                    mtime = d.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                envs.append({"session_id": d.name, "path": str(d), "mtime": mtime})
+            envs.sort(key=lambda x: x["mtime"], reverse=True)
+        return {"snapshots": snaps[:20], "envs": envs[:20]}
+
+    # -- global search ------------------------------------------------------- #
+
+    def search_all(self, query: str) -> dict:
+        q = query.lower().strip()
+        if not q:
+            return {"sessions": [], "prompts": []}
+        sessions = []
+        for key, s in self._cache.items():
+            hay = " ".join((s.get("title", ""), s.get("first_prompt", ""), s.get("cwd", ""), s.get("session_id", ""))).lower()
+            if q in hay:
+                p = Path(key)
+                sessions.append(
+                    {
+                        "project_id": p.parent.name,
+                        "project_name": Path(s.get("cwd", "")).name or p.parent.name,
+                        "session_id": s.get("session_id", ""),
+                        "title": s.get("title") or s.get("first_prompt", ""),
+                        "cost": s.get("cost", 0),
+                        "mtime": s.get("mtime", 0),
+                    }
+                )
+        sessions.sort(key=lambda x: x["mtime"], reverse=True)
+
+        prompts = []
+        hist = paths.claude_home() / "history.jsonl"
+        if hist.is_file():
+            try:
+                for line in hist.read_text("utf-8", errors="replace").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    display = rec.get("display", "")
+                    if q in display.lower():
+                        project = rec.get("project", "")
+                        prompts.append(
+                            {
+                                "display": display[:220],
+                                "project": project,
+                                "project_name": Path(project).name if project else "",
+                                "project_id": paths.encode_project_path(project) if project else "",
+                                "session_id": rec.get("sessionId", ""),
+                                "timestamp": rec.get("timestamp", 0),
+                            }
+                        )
+            except OSError:
+                pass
+        prompts.reverse()  # newest first
+        return {"sessions": sessions[:50], "prompts": prompts[:50]}
 
     # -- settings & statusline --------------------------------------------- #
 
@@ -206,7 +381,6 @@ class Scanner:
                     data = {}
                 merged.update(data)
                 raw.append({"name": f.name, "path": str(f), "data": data})
-        # Statusline command script contents, if referenced.
         statusline = merged.get("statusLine", {})
         sl_script = None
         cmd = statusline.get("command", "") if isinstance(statusline, dict) else ""
@@ -236,12 +410,10 @@ class Scanner:
 
 
 def _parse_frontmatter(text: str) -> dict:
-    """Light parse of the YAML-ish frontmatter used by memory files."""
     meta: dict[str, str] = {}
     if not text.startswith("---"):
         return meta
-    lines = text.splitlines()
-    for line in lines[1:]:
+    for line in text.splitlines()[1:]:
         if line.strip() == "---":
             break
         if ":" in line:
