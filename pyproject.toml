@@ -1,0 +1,28 @@
+[project]
+name = "claude-session-manager"
+version = "0.1.0"
+description = "A modern desktop visualizer for Claude Code sessions, memory, subagents, scratchpads, settings and live state."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Devin" }]
+dependencies = [
+    "PySide6>=6.7",
+    "watchdog>=4.0",
+]
+
+[project.scripts]
+csm = "csm.app:main"
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["csm"]
+
+# Include the web frontend assets inside the package/wheel and PyInstaller bundle.
+[tool.hatch.build.targets.wheel.force-include]
+"web" = "csm/web"
