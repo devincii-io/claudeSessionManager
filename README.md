@@ -1,5 +1,9 @@
 # Claude Session Manager
 
+> **Unofficial community tool** — not affiliated with, or endorsed by, Anthropic.
+> "Claude" is a trademark of Anthropic, PBC. This app only reads files that
+> Claude Code stores on your own machine.
+
 A modern, fast desktop app for exploring everything **Claude Code** stores on your
 machine — sessions, memory, subagents, scratchpads, tasks, images, shells,
 settings and live state — all grouped by project and richly visualized. Built
