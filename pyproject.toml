@@ -8,6 +8,7 @@ authors = [{ name = "Devin" }]
 dependencies = [
     "PySide6>=6.7",
     "watchdog>=4.0",
+    "orjson>=3.9",
 ]
 
 [project.scripts]
