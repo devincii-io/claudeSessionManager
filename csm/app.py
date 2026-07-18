@@ -56,6 +56,18 @@ from .watcher import Watcher
 APP_NAME = "Claude Session Manager"
 
 
+def _close_splash() -> None:
+    """Dismiss the PyInstaller onefile splash, if one is showing (frozen build)."""
+    if "_PYI_SPLASH_IPC" not in os.environ:
+        return  # no active splash (dev run, or a build without one)
+    try:
+        import pyi_splash  # type: ignore  # injected only in the frozen onefile exe
+
+        pyi_splash.close()
+    except Exception:
+        pass
+
+
 def app_icon() -> QIcon:
     """Multi-resolution application icon (taskbar, alt-tab, window)."""
     icon = QIcon()
@@ -109,8 +121,24 @@ class MainWindow(QMainWindow):
 
         index = asset_dir() / "index.html"
         self._view.load(QUrl.fromLocalFile(str(index)))
+        # Drop the onefile splash as soon as the UI has actually painted.
+        self._view.loadFinished.connect(self._on_first_load)
 
         self._watcher.start()
+
+    def _on_first_load(self, ok: bool) -> None:  # noqa: FBT001
+        _close_splash()
+        # Headless self-check (set CSM_SELFTEST=1): confirm the WebEngine page
+        # actually rendered, then exit 0/1. Lets a packaged build be smoke-tested.
+        if os.environ.get("CSM_SELFTEST"):
+            if not ok:
+                print("SELFTEST: loadFinished(False)")
+                QCoreApplication.exit(1)
+                return
+            self._view.page().runJavaScript(
+                "(typeof State!=='undefined' && document.querySelector('.nav-item')) ? 'RENDER_OK' : 'RENDER_FAIL'",
+                lambda r: (print("SELFTEST:", r), QCoreApplication.exit(0 if r == "RENDER_OK" else 1)),
+            )
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         self._watcher.stop()

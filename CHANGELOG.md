@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.0] — 2026-07-18
+
+First stable release. The app now covers the full lifecycle — explore, analyze,
+tune and clean up — and ships as a single self-contained executable for Windows
+and Linux.
+
+### Added
+- **Cleanup** — a disk-space helper that lists every session on the machine with
+  its full on-disk footprint (transcript + tasks / file-history / image-cache /
+  session-env). Multi-select by hand or with one-tap presets (empty, small talk,
+  under 1¢, older than 30 days, largest 10), sort by size / age / cost, and
+  delete in bulk (optionally purging ancillary data). Live sessions are
+  protected from deletion. Select-to-delete is also available inside a project's
+  session list.
+- **Tune** — put your own signed-in `claude` CLI to work on your history,
+  headless: **Refine CLAUDE.md** (global or per-project) folds durable
+  conventions from recent sessions into a guidance file you review and save, and
+  **Consolidate → memory** distills sessions into memory notes written to a
+  project's memory store. Runs asynchronously so the UI never blocks; only
+  session summaries are ever sent, never full transcripts.
+- **Privacy-first settings** — a Privacy & data section with one-tap protections
+  (keep sessions off claude.ai, master non-essential-traffic switch, disable
+  telemetry / error reporting, drop the commit co-author trailer) and an **Apply
+  privacy-first defaults** button.
+
+### Changed
+- **Settings redesigned** to be comprehensive but clean: a catalog of known
+  settings, a dedicated environment-variable editor, and arbitrary custom
+  key/value + env entries — so *any* setting is reachable. Only settings you
+  actually set are written to `settings.json`; removing one prunes it (and any
+  now-empty parent like `env`) so the file never accumulates dead keys.
+- **Packaging is now single-file (onefile)**: one self-contained executable with
+  no `_internal` folder beside it, a native splash screen during cold start, an
+  app icon, and trimmed Qt modules for a smaller, faster-to-extract build.
+
 ## [0.4.0] — 2026-07-18
 
 ### Added

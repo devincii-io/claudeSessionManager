@@ -13,6 +13,7 @@ Performance:
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections import Counter
 from dataclasses import asdict
@@ -144,6 +145,76 @@ class Scanner:
         self._save_cache()
         out.sort(key=lambda s: s["mtime"], reverse=True)
         return out
+
+    def all_sessions(self) -> dict:
+        """Every session on the machine as a lightweight record, newest-heaviest
+        first — powers the Cleanup helper and the "which sessions to include"
+        picker. Built from cached summaries plus each session's on-disk footprint
+        (transcript + ancillary tasks/history/image/env data)."""
+        root = paths.projects_dir()
+        now = time.time()
+        out: list[dict] = []
+        if root.is_dir():
+            for pdir in sorted(root.iterdir()):
+                if not pdir.is_dir():
+                    continue
+                summaries = [self._summary(f) for f in pdir.glob("*.jsonl")]
+                cwd = next((s.cwd for s in summaries if s.cwd), "")
+                pname = Path(cwd).name if cwd else pdir.name.lstrip("-").replace("-", "/")
+                for s in summaries:
+                    extra = self._session_footprint(s.session_id)
+                    out.append({
+                        "project_id": pdir.name,
+                        "project_name": pname or pdir.name,
+                        "project_path": cwd,
+                        "session_id": s.session_id,
+                        "title": s.title or s.first_prompt or "Untitled session",
+                        "first_prompt": s.first_prompt,
+                        "cost": round(s.cost, 4),
+                        "tokens": (s.usage or {}).get("total", 0) if isinstance(s.usage, dict) else 0,
+                        "user_messages": s.user_messages,
+                        "assistant_messages": s.assistant_messages,
+                        "tool_calls": s.tool_calls,
+                        "size_bytes": s.size_bytes,
+                        "extra_bytes": extra,
+                        "mtime": s.mtime,
+                        "created": s.created,
+                        "active": now - s.mtime <= ACTIVE_WINDOW_SECONDS,
+                        "has_subagents": s.has_subagents,
+                        "models": [m for m in s.models if m != "<synthetic>"],
+                    })
+        self._save_cache()
+        out.sort(key=lambda x: x["size_bytes"] + x["extra_bytes"], reverse=True)
+        total_bytes = sum(x["size_bytes"] + x["extra_bytes"] for x in out)
+        return {"sessions": out, "home": str(paths.claude_home()), "total_bytes": total_bytes}
+
+    def summaries_for(self, items: list) -> list[dict]:
+        """Cached summary dicts for a list of ``{project_id, session_id}`` — the
+        context an assistant job digests (never full transcripts)."""
+        out: list[dict] = []
+        for it in items or []:
+            pid = (it or {}).get("project_id")
+            sid = (it or {}).get("session_id")
+            if not pid or not sid:
+                continue
+            f = paths.projects_dir() / pid / f"{sid}.jsonl"
+            if f.is_file():
+                out.append(self._summary(f).to_dict())
+        return out
+
+    def _session_footprint(self, session_id: str) -> int:
+        """Bytes of a session's ancillary data (tasks, file-history, image-cache,
+        session-env) — the extra space a purge deletion reclaims."""
+        home = paths.claude_home()
+        total = 0
+        for d in (
+            paths.tasks_dir(session_id),
+            paths.file_history_dir(session_id),
+            paths.image_cache_dir(session_id),
+            home / "session-env" / session_id,
+        ):
+            total += _dir_size(d)
+        return total
 
     def project_path(self, project_id: str) -> str:
         pdir = paths.projects_dir() / project_id
@@ -502,6 +573,24 @@ class Scanner:
             return data
         except (OSError, json.JSONDecodeError):
             return None
+
+
+def _dir_size(d: Path) -> int:
+    """Total size of files under ``d`` (bounded recursion), 0 if missing."""
+    total = 0
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                try:
+                    if e.is_file(follow_symlinks=False):
+                        total += e.stat(follow_symlinks=False).st_size
+                    elif e.is_dir(follow_symlinks=False):
+                        total += _dir_size(Path(e.path))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return total
 
 
 def _parse_frontmatter(text: str) -> dict:

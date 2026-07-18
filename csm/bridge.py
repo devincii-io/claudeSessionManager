@@ -8,10 +8,11 @@ the UI can refresh live without redrawing on every byte appended to a transcript
 from __future__ import annotations
 
 import json
+from uuid import uuid4
 
-from PySide6.QtCore import QObject, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QProcess, QTimer, Signal, Slot
 
-from . import actions, paths
+from . import actions, assistant, paths
 from .scanner import Scanner
 from .watcher import Watcher
 
@@ -21,7 +22,8 @@ def _j(obj) -> str:
 
 
 class Bridge(QObject):
-    dataChanged = Signal(str)  # emitted (debounced) when the filesystem changes
+    dataChanged = Signal(str)      # emitted (debounced) when the filesystem changes
+    assistantEvent = Signal(str)   # async result of a claude-CLI job (JSON)
 
     def __init__(self, scanner: Scanner, watcher: Watcher) -> None:
         super().__init__()
@@ -30,6 +32,7 @@ class Bridge(QObject):
         self._window = None  # set by the application shell
         self._open_session: tuple[str, str] | None = None
         self._pending_reason: str | None = None
+        self._jobs: dict[str, tuple[QProcess, str]] = {}  # job_id -> (proc, kind)
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -103,6 +106,10 @@ class Bridge(QObject):
     def getGlobalStats(self) -> str:
         return _j(self._scanner.global_stats())
 
+    @Slot(result=str)
+    def getAllSessions(self) -> str:
+        return _j(self._scanner.all_sessions())
+
     @Slot(str, result=str)
     def getMemory(self, project_id: str) -> str:
         return _j(self._scanner.get_memory(project_id))
@@ -133,6 +140,14 @@ class Bridge(QObject):
     def deleteSession(self, project_id: str, session_id: str, purge: bool) -> str:
         return _j(actions.delete_session(project_id, session_id, purge))
 
+    @Slot(str, bool, result=str)
+    def deleteSessions(self, items_json: str, purge: bool) -> str:
+        try:
+            items = json.loads(items_json)
+        except json.JSONDecodeError:
+            items = []
+        return _j(actions.delete_sessions(items, purge))
+
     @Slot(str, result=str)
     def deleteScratchpadFile(self, path: str) -> str:
         return _j(actions.delete_scratchpad_file(path))
@@ -153,6 +168,15 @@ class Bridge(QObject):
             value = value_json
         return _j(actions.update_setting(key, value))
 
+    @Slot(str, result=str)
+    def updateSettings(self, items_json: str) -> str:
+        """Apply many edits at once (each ``{"key","value"}``; null value = delete)."""
+        try:
+            items = json.loads(items_json)
+        except json.JSONDecodeError:
+            items = []
+        return _j(actions.update_settings(items))
+
     @Slot(result=str)
     def listConfigFiles(self) -> str:
         return _j({"files": actions.list_config_files()})
@@ -172,6 +196,81 @@ class Bridge(QObject):
     def windowClose(self) -> None:
         if self._window is not None:
             self._window.close()
+
+    # -- CLAUDE.md guidance & consolidation -------------------------------- #
+
+    @Slot(str, str, result=str)
+    def getGuidance(self, scope: str, project_path: str) -> str:
+        return _j(actions.read_guidance(scope, project_path))
+
+    @Slot(str, str, str, result=str)
+    def saveGuidance(self, scope: str, content: str, project_path: str) -> str:
+        return _j(actions.write_guidance(scope, content, project_path))
+
+    @Slot(str, str, result=str)
+    def writeMemoryNotes(self, project_id: str, notes_json: str) -> str:
+        try:
+            notes = json.loads(notes_json)
+        except json.JSONDecodeError:
+            notes = []
+        return _j(actions.write_memory_notes(project_id, notes))
+
+    @Slot(str, result=str)
+    def startAssistant(self, req_json: str) -> str:
+        """Launch a headless ``claude`` job. Returns a job_id immediately; the
+        result arrives later via the ``assistantEvent`` signal so the UI never
+        blocks on the (multi-second) model call."""
+        try:
+            req = json.loads(req_json)
+        except json.JSONDecodeError:
+            return _j({"ok": False, "error": "bad request"})
+        binp = assistant.claude_bin()
+        if not binp:
+            return _j({"ok": False, "error": "The 'claude' CLI was not found. Install Claude Code and sign in."})
+
+        kind = req.get("kind", "tune")
+        summaries = self._scanner.summaries_for(req.get("sessions") or [])
+        if kind == "consolidate":
+            prompt = assistant.build_consolidate_prompt(req, summaries)
+        else:
+            prompt = assistant.build_tune_prompt(req, summaries)
+
+        job_id = uuid4().hex
+        proc = QProcess(self)
+        proc.setProgram(binp)
+        proc.setArguments(["-p", prompt, "--output-format", "json"])
+        proc.finished.connect(lambda code, _status, jid=job_id: self._assistant_finished(jid, code))
+        proc.errorOccurred.connect(lambda _e, jid=job_id: self._assistant_error(jid))
+        self._jobs[job_id] = (proc, kind)
+        proc.start()
+        return _j({"ok": True, "job_id": job_id})
+
+    def _assistant_finished(self, job_id: str, code: int) -> None:
+        entry = self._jobs.pop(job_id, None)
+        if entry is None:
+            return
+        proc, kind = entry
+        out = bytes(proc.readAllStandardOutput()).decode("utf-8", "replace")
+        err = bytes(proc.readAllStandardError()).decode("utf-8", "replace")
+        result = assistant.parse_result(out, err, code)
+        # Consolidate returns a JSON array of notes — parse it here (tolerant of
+        # code fences / stray prose) so the UI receives ready-to-write records.
+        if kind == "consolidate" and result.get("ok"):
+            result["notes"] = assistant.parse_memory_notes(result.get("text") or "")
+        result["kind"] = kind
+        result["job_id"] = job_id
+        result["status"] = "done" if result.get("ok") else "error"
+        self.assistantEvent.emit(_j(result))
+
+    def _assistant_error(self, job_id: str) -> None:
+        entry = self._jobs.pop(job_id, None)
+        if entry is None:
+            return
+        proc, _kind = entry
+        self.assistantEvent.emit(_j({
+            "job_id": job_id, "status": "error",
+            "ok": False, "error": proc.errorString() or "failed to start claude",
+        }))
 
     @Slot(result=str)
     def statuslineStatus(self) -> str:

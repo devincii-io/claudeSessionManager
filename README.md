@@ -17,6 +17,8 @@ extensible UI) and managed with **uv**. Cross-platform: Linux and Windows.
 | Overview | Transcript |
 |---|---|
 | ![Overview](docs/overview.png) | ![Transcript](docs/transcript.png) |
+| **Cleanup** | **Privacy-first settings** |
+| ![Cleanup](docs/cleanup.png) | ![Settings](docs/settings.png) |
 
 *(Screenshots show generated demo data.)*
 
@@ -49,8 +51,20 @@ Docs: [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
   files with frontmatter), with in-app **edit / save / delete**.
 - **Scratchpads** — the per-session scratchpad tree, with previews.
 - **Tasks** — the per-session task board.
-- **Settings** — merged user settings, raw settings files, and the statusline
-  script.
+- **Cleanup** — reclaim disk space: every session on the machine with its full
+  on-disk footprint, multi-selected by hand or with one-tap presets (empty, small
+  talk, under 1¢, older than 30 days, largest 10) and deleted in bulk. Live
+  sessions are protected.
+- **Tune** — drive your own signed-in `claude` CLI over your history to **refine
+  a CLAUDE.md** (global or per-project) or **consolidate sessions into memory
+  notes**. Runs headless and async; only session summaries are sent, never full
+  transcripts.
+- **Settings** — a comprehensive, catalog-driven editor: a **Privacy & data**
+  section with one-tap privacy-first defaults (keep sessions off claude.ai, kill
+  non-essential traffic, disable telemetry / error reporting), a dedicated
+  **environment-variable** editor, and arbitrary custom keys — all writing
+  straight to `settings.json`. Only settings you actually set are written;
+  removing one prunes it, so the file never accumulates dead keys.
 - **Live monitor** — active sessions and context pressure, updated live via a
   filesystem watcher.
 - **Live statusline capture** (opt-in) — rate limits (5h / 7d) and live context %
@@ -94,12 +108,14 @@ or `uv run python -m csm.app`.
 
 ```bash
 uv sync --extra build
-uv run pyinstaller --noconfirm --windowed --name ClaudeSessionManager \
-  --icon web/icons/app.ico \
-  --add-data "web:web" launcher.py    # use "web;web" on Windows
+uv run pyinstaller --noconfirm ClaudeSessionManager.spec
 ```
 
-The result lands in `dist/`. Runs on Linux and Windows.
+This produces a **single-file** `dist/ClaudeSessionManager` executable — no
+`_internal` folder beside it. On Windows it carries the app icon and shows a
+splash screen while it unpacks on first launch. PyInstaller cannot
+cross-compile, so run the build on the OS you're targeting (on Windows via
+`powershell.exe` + a Windows `uv` when working from WSL).
 
 ## Architecture
 
@@ -110,7 +126,8 @@ csm/
   session_parser.py   streaming .jsonl parser (summary + detail)
   scanner.py          enumerate projects/sessions/memory/tasks/scratchpad/settings (cached)
   watcher.py          watchdog → Qt signals (live updates)
-  actions.py          delete / save / open-in-editor / statusline hook
+  actions.py          delete / bulk-delete / save / settings / statusline hook
+  assistant.py        headless `claude` CLI prompts + output parsing (Tune)
   bridge.py           QWebChannel object exposed to JS
   app.py              QApplication + QWebEngineView shell
 web/

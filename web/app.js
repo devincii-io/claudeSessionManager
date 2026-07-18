@@ -14,10 +14,42 @@ const State = {
   detail: null,
   memory: null,
   settings: null,
-  view: "overview", // overview | project | session | memory | settings | monitor
+  view: "overview", // overview | project | session | memory | settings | monitor | cleanup
   tab: "transcript",
   search: "",
+  sel: new Map(),      // selKey -> { pid, sid, title, cost, bytes } — shared multiselect
+  selectMode: false,   // project session pane: select-to-delete mode
+  cleanup: null,       // getAllSessions payload
+  cleanupSort: "size", // size | age | cost
+  tune: null,          // Tune view state (see loadTune)
 };
+
+/* ---------- multiselect ---------- */
+
+function selKey(pid, sid) { return pid + "␟" + sid; }
+function isSel(pid, sid) { return State.sel.has(selKey(pid, sid)); }
+function toggleSel(rec) {
+  const k = selKey(rec.pid, rec.sid);
+  if (State.sel.has(k)) State.sel.delete(k); else State.sel.set(k, rec);
+}
+function clearSel() { State.sel.clear(); }
+// Re-render a scrolling pane without losing the user's scroll position — used
+// when toggling selections in a potentially long list.
+function keepScroll(paneId, render) {
+  const before = document.getElementById(paneId);
+  const top = before ? before.scrollTop : 0;
+  render();
+  const after = document.getElementById(paneId);
+  if (after) after.scrollTop = top;
+}
+function selTotals() {
+  let cost = 0, bytes = 0;
+  for (const r of State.sel.values()) { cost += r.cost || 0; bytes += r.bytes || 0; }
+  return { count: State.sel.size, cost, bytes };
+}
+function selItems() {
+  return [...State.sel.values()].map((r) => ({ project_id: r.pid, session_id: r.sid }));
+}
 
 /* ---------- backend plumbing ---------- */
 
@@ -196,16 +228,27 @@ function renderListPane() {
 function projectListPane() {
   const p = State.projects.find((x) => x.id === State.projectId);
   const sessions = State.sessions.filter(sessionMatchesSearch);
+  const sm = State.selectMode;
+  const t = selTotals();
   return `<div class="list-head">
       <h2>${esc(p ? p.name : "Sessions")}</h2>
-      <div class="sub">${sessions.length} sessions${p && p.memory_count ? ` · ${p.memory_count} memories` : ""}</div>
+      <div class="sub" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <span>${sessions.length} sessions${p && p.memory_count ? ` · ${p.memory_count} memories` : ""}</span>
+        <button class="link-btn" data-action="toggle-select">${sm ? "Cancel" : "Select"}</button>
+      </div>
+      ${sm ? `<div class="mini-bar">
+        <span>${t.count ? `<b>${t.count}</b> selected · ${fmt.bytes(t.bytes)}` : "Tap sessions to select"}</span>
+        <span style="display:flex;gap:6px">
+          ${t.count ? `<button class="btn sm" data-action="sel-clear">Clear</button>
+          <button class="btn sm primary danger" data-action="bulk-delete">Delete ${t.count}</button>` : ""}
+        </span></div>` : ""}
     </div>
     <div class="list-body">
-      <div class="file-row ${State.view === "memory" ? "active" : ""}" data-action="memory">
+      ${sm ? "" : `<div class="file-row ${State.view === "memory" ? "active" : ""}" data-action="memory">
         <div class="file-ic">◇</div>
         <div><div class="f-name">Memory</div><div class="f-desc">${p ? p.memory_count : 0} memory files + index</div></div>
         <div class="file-meta">›</div>
-      </div>
+      </div>`}
       ${sessions.map(sessionCard).join("") || '<div class="faint" style="padding:14px;font-size:12px">No sessions.</div>'}
     </div>`;
 }
@@ -224,7 +267,11 @@ function sessionCard(s) {
   if (s.active) badges.push('<span class="badge green"><span class="dot-active"></span> live</span>');
   if (s.has_subagents) badges.push(badge("subagents", "magenta"));
   (s.models || []).slice(0, 2).forEach((m) => badges.push(badge(shortModel(m), "")));
-  return `<div class="session-card ${s.session_id === State.sessionId ? "active" : ""}" data-action="session" data-id="${esc(s.session_id)}">
+  const sm = State.selectMode;
+  const sel = sm && isSel(State.projectId, s.session_id);
+  const cls = sel ? "sel" : (s.session_id === State.sessionId ? "active" : "");
+  return `<div class="session-card ${sm ? "selectable" : ""} ${cls}" data-action="${sm ? "session-toggle" : "session"}" data-id="${esc(s.session_id)}">
+    ${sm ? `<input type="checkbox" class="chk sc-chk" ${sel ? "checked" : ""} tabindex="-1">` : ""}
     <div class="sc-title">${esc(title)}</div>
     <div class="sc-meta">
       <span><b>${s.assistant_messages}</b> turns</span>
@@ -243,6 +290,8 @@ function renderDetail() {
   const el = document.getElementById("detail-pane");
   if (State.view === "settings") return void (el.innerHTML = settingsView());
   if (State.view === "monitor") return void (el.innerHTML = monitorView());
+  if (State.view === "cleanup") return void (el.innerHTML = cleanupView());
+  if (State.view === "tune") return void (el.innerHTML = tuneView());
   if (State.view === "search") return void (el.innerHTML = searchView());
   if (State.view === "memory") return void (el.innerHTML = memoryView());
   if (State.view === "session" && State.detail) return void (el.innerHTML = sessionView());
@@ -673,33 +722,76 @@ function memoryEditor(path) {
     <textarea class="editor" id="mem-textarea" spellcheck="false">${esc(f.content)}</textarea></div>`;
 }
 
-/* ---------- settings view ---------- */
+/* ---------- settings view (catalog-driven; only set keys are written) -------- */
 
-const SETTINGS_TOGGLES = [
-  ["alwaysThinkingEnabled", "Always thinking"],
-  ["autoCompactEnabled", "Auto-compact context"],
-  ["fileCheckpointingEnabled", "File checkpointing"],
-  ["todoFeatureEnabled", "Todo feature"],
-  ["promptSuggestionEnabled", "Prompt suggestions"],
-  ["spinnerTipsEnabled", "Spinner tips"],
-  ["verbose", "Verbose output"],
-  ["inputNeededNotifEnabled", "Input-needed notifications"],
-  ["agentPushNotifEnabled", "Agent push notifications"],
-  ["enableArtifact", "Artifacts"],
-  ["enableWorkflows", "Workflows"],
-  ["workflowKeywordTriggerEnabled", "Workflow keyword trigger"],
-  ["skipDangerousModePermissionPrompt", "Skip dangerous-mode prompt"],
-  ["skipWorkflowUsageWarning", "Skip workflow usage warning"],
-  ["autoUploadSessions", "Auto-upload sessions"],
+// Single source of truth for known settings. Add a row here to surface a new
+// setting — nothing touches settings.json until the user actually sets it.
+// type: bool | enum | number | string | envflag | envstr
+//   envflag → lives under env.*, stored as the string "1" (a switch)
+//   envstr  → lives under env.*, free-form string value
+const SETTING_CATALOG = [
+  // [group, key, label, type, options?, desc?]
+  ["Model & behavior", "model", "Model", "enum", ["default", "opus", "sonnet", "haiku", "fable"]],
+  ["Model & behavior", "effortLevel", "Effort level", "enum", ["low", "medium", "high", "xhigh", "max"]],
+  ["Model & behavior", "outputStyle", "Output style", "string"],
+  ["Model & behavior", "alwaysThinkingEnabled", "Always thinking", "bool"],
+  ["Model & behavior", "autoCompactEnabled", "Auto-compact context", "bool"],
+  ["Model & behavior", "fileCheckpointingEnabled", "File checkpointing", "bool"],
+  ["Model & behavior", "todoFeatureEnabled", "Todo feature", "bool"],
+  ["Model & behavior", "promptSuggestionEnabled", "Prompt suggestions", "bool"],
+  ["Model & behavior", "enableAllProjectMcpServers", "Enable all project MCP servers", "bool"],
+  ["Model & behavior", "cleanupPeriodDays", "Keep transcripts (days)", "number", null, "Auto-delete local session transcripts after this many days."],
+
+  ["Interface", "theme", "Theme", "enum", ["dark", "light"]],
+  ["Interface", "tui", "Interface", "enum", ["fullscreen", "inline"]],
+  ["Interface", "verbose", "Verbose output", "bool"],
+  ["Interface", "spinnerTipsEnabled", "Spinner tips", "bool"],
+  ["Interface", "enableArtifact", "Artifacts", "bool"],
+
+  ["Notifications", "preferredNotifChannel", "Notification channel", "enum", ["iterm2", "terminal_bell", "iterm2_with_bell", "kitty", "notifications_disabled"]],
+  ["Notifications", "inputNeededNotifEnabled", "Input-needed notifications", "bool"],
+  ["Notifications", "agentPushNotifEnabled", "Agent push notifications", "bool"],
+  ["Notifications", "messageIdleNotifThresholdMs", "Idle-notify threshold (ms)", "number"],
+
+  ["Permissions", "permissions.defaultMode", "Permission mode", "enum", ["default", "acceptEdits", "plan", "bypassPermissions"]],
+  ["Permissions", "skipDangerousModePermissionPrompt", "Skip dangerous-mode prompt", "bool"],
+  ["Permissions", "teammateMode", "Teammate mode", "enum", ["auto", "on", "off"]],
+
+  ["Workflows", "enableWorkflows", "Workflows", "bool"],
+  ["Workflows", "workflowKeywordTriggerEnabled", "Workflow keyword trigger", "bool"],
+  ["Workflows", "skipWorkflowUsageWarning", "Skip workflow usage warning", "bool"],
+
+  ["Updates", "autoUpdatesChannel", "Updates channel", "enum", ["latest", "stable"]],
+
+  ["Privacy & data", "autoUploadSessions", "Auto-upload sessions to claude.ai", "bool"],
+  ["Privacy & data", "includeCoAuthoredBy", "Add “Co-Authored-By: Claude” to commits", "bool"],
+  ["Privacy & data", "apiKeyHelper", "API key helper (script path)", "string"],
+
+  ["Environment", "env.DISABLE_TELEMETRY", "Disable telemetry", "envflag"],
+  ["Environment", "env.DISABLE_ERROR_REPORTING", "Disable error reporting", "envflag"],
+  ["Environment", "env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "Disable all non-essential traffic", "envflag"],
+  ["Environment", "env.DISABLE_AUTOUPDATER", "Disable auto-updater", "envflag"],
+  ["Environment", "env.ANTHROPIC_MODEL", "ANTHROPIC_MODEL", "envstr"],
+  ["Environment", "env.ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "envstr"],
+  ["Environment", "env.BASH_DEFAULT_TIMEOUT_MS", "BASH_DEFAULT_TIMEOUT_MS", "envstr"],
+  ["Environment", "env.BASH_MAX_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS", "envstr"],
+  ["Environment", "env.MCP_TIMEOUT", "MCP_TIMEOUT", "envstr"],
+  ["Environment", "env.CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "envstr"],
 ];
-const SETTINGS_SELECTS = [
-  ["model", "Model", ["default", "opus", "sonnet", "haiku", "fable"]],
-  ["effortLevel", "Effort level", ["low", "medium", "high", "xhigh", "max"]],
-  ["theme", "Theme", ["dark", "light"]],
-  ["tui", "Interface", ["fullscreen", "inline"]],
-  ["permissions.defaultMode", "Permission mode", ["default", "acceptEdits", "plan", "bypassPermissions"]],
-  ["teammateMode", "Teammate mode", ["auto", "on", "off"]],
-  ["autoUpdatesChannel", "Updates channel", ["latest", "stable"]],
+const CATALOG_BY_KEY = Object.fromEntries(SETTING_CATALOG.map((c) => [c[1], c]));
+// First path segment of every known key — used to leave truly-unknown top-level
+// keys alone in the "Other" section instead of double-editing them.
+const CATALOG_TOP = new Set(SETTING_CATALOG.map((c) => c[1].split(".")[0]).concat("env"));
+
+// Curated privacy-first switches. `private` is the most-private value; turning a
+// protection ON writes it, OFF removes the key (revert to default) — so the file
+// only ever holds choices you actively made.
+const PRIVACY_ITEMS = [
+  { key: "autoUploadSessions", label: "Keep sessions on this machine", desc: "Don’t mirror your sessions to claude.ai.", private: false },
+  { key: "env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", label: "Disable all non-essential traffic", desc: "Master switch — turns off telemetry, error reports, feedback & surveys at once.", private: "1" },
+  { key: "env.DISABLE_TELEMETRY", label: "Disable usage telemetry", desc: "No usage or latency metrics leave your machine.", private: "1" },
+  { key: "env.DISABLE_ERROR_REPORTING", label: "Disable error reporting", desc: "No crash reports or stack traces are sent.", private: "1" },
+  { key: "includeCoAuthoredBy", label: "No “Co-Authored-By: Claude” in commits", desc: "Keep Claude out of your git history and PRs.", private: false },
 ];
 
 function getNested(obj, key) {
@@ -710,33 +802,139 @@ function setNested(obj, key, val) {
   for (let i = 0; i < parts.length - 1; i++) { if (typeof o[parts[i]] !== "object" || !o[parts[i]]) o[parts[i]] = {}; o = o[parts[i]]; }
   o[parts[parts.length - 1]] = val;
 }
+function isSet(merged, key) { return getNested(merged, key) !== undefined; }
+function scalar(v) { return v === null || ["boolean", "number", "string"].includes(typeof v); }
 
-function settingToggle(key, label, val) {
-  return `<div class="setting-row"><div><div class="s-label">${esc(label)}</div><div class="s-key">${esc(key)}</div></div>
-    <label class="switch"><input type="checkbox" data-setting="${esc(key)}" data-type="bool" ${val ? "checked" : ""}><span class="track"><span class="thumb"></span></span></label></div>`;
+function privacyOn(merged, item) {
+  const v = getNested(merged, item.key);
+  if (v === undefined) return false;
+  if (item.private === "1") return v === "1" || v === "true" || v === 1 || v === true;
+  return v === item.private;
 }
-function settingSelect(key, label, options, val) {
-  const opts = (val != null && !options.includes(val)) ? [val, ...options] : options;
-  return `<div class="setting-row"><div><div class="s-label">${esc(label)}</div><div class="s-key">${esc(key)}</div></div>
-    <select class="select" data-setting="${esc(key)}" data-type="str">${opts.map((o) => `<option ${o === val ? "selected" : ""}>${esc(o)}</option>`).join("")}</select></div>`;
+
+// One editable control for a scalar setting, tagged so the change handler knows
+// how to coerce and write it. `catalog` = the [group,key,label,type,opts,desc] row.
+function settingControl(key, type, options, val) {
+  const k = esc(key);
+  if (type === "bool") {
+    return `<label class="switch"><input type="checkbox" data-setting="${k}" data-type="bool" ${val ? "checked" : ""}><span class="track"><span class="thumb"></span></span></label>`;
+  }
+  if (type === "envflag") {
+    const on = val === "1" || val === "true" || val === true || val === 1;
+    return `<label class="switch"><input type="checkbox" data-setting="${k}" data-type="envflag" ${on ? "checked" : ""}><span class="track"><span class="thumb"></span></span></label>`;
+  }
+  if (type === "enum") {
+    const opts = (val != null && !options.includes(val)) ? [val, ...options] : options;
+    return `<select class="select" data-setting="${k}" data-type="str">${opts.map((o) => `<option ${o === val ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+  }
+  const dt = type === "number" ? "num" : (type === "envstr" ? "envstr" : "str");
+  return `<input class="s-input" type="${type === "number" ? "number" : "text"}" data-setting="${k}" data-type="${dt}" value="${esc(val == null ? "" : val)}" placeholder="unset">`;
+}
+
+// A full settings row: label + key + control + a remove (×) button that unsets it.
+function settingRow(key, val) {
+  const cat = CATALOG_BY_KEY[key];
+  const label = cat ? cat[2] : key;
+  const type = cat ? cat[3] : (typeof val === "boolean" ? "bool" : typeof val === "number" ? "number" : "string");
+  const options = cat ? cat[4] : null;
+  const desc = cat && cat[5] ? cat[5] : "";
+  return `<div class="setting-row">
+    <div class="s-main"><div class="s-label">${esc(label)}</div><div class="s-key">${esc(key)}</div>${desc ? `<div class="s-desc">${esc(desc)}</div>` : ""}</div>
+    <div class="s-ctl">${settingControl(key, type, options, val)}
+      <button class="s-x" data-action="setting-remove" data-key="${esc(key)}" title="Remove from settings.json">×</button></div>
+  </div>`;
+}
+
+function complexRow(key, val) {
+  let preview; try { preview = JSON.stringify(val); } catch { preview = String(val); }
+  if (preview.length > 120) preview = preview.slice(0, 117) + "…";
+  return `<div class="setting-row">
+    <div class="s-main"><div class="s-label">${esc(key)}</div><div class="s-key mono">${esc(preview)}</div></div>
+    <div class="s-ctl"><button class="btn sm" data-action="open-settings-json">Edit in settings.json</button>
+      <button class="s-x" data-action="setting-remove" data-key="${esc(key)}" title="Remove from settings.json">×</button></div>
+  </div>`;
+}
+
+function privacyRow(merged, item) {
+  const on = privacyOn(merged, item);
+  return `<div class="setting-row priv ${on ? "on" : ""}">
+    <div class="s-main"><div class="s-label">${esc(item.label)}${on ? ' <span class="priv-tag">on</span>' : ""}</div><div class="s-desc">${esc(item.desc)}</div><div class="s-key">${esc(item.key)}</div></div>
+    <label class="switch"><input type="checkbox" data-role="privacy" data-key="${esc(item.key)}" ${on ? "checked" : ""}><span class="track"><span class="thumb"></span></span></label>
+  </div>`;
 }
 
 function settingsView() {
   const s = State.settings;
   if (!s) return `<div class="detail-inner"><div class="skeleton">Loading settings…</div></div>`;
   const merged = s.merged || {};
+  const env = merged.env && typeof merged.env === "object" ? merged.env : {};
   const live = s.live;
   const sl = State.statuslineStatus || {};
   const cfg = State.configFiles || [];
 
-  return `<div class="detail-inner">
-    <div class="page-head"><div><h1>Settings</h1><div class="ph-sub mono">${esc(s.home)}</div></div>
-      <div class="page-actions"><button class="btn sm" data-action="open-folder" data-path="${esc(s.home)}">Open folder</button></div></div>
+  // Known catalog settings that are currently set (excludes env — its own section).
+  const activeKnown = SETTING_CATALOG.filter((c) => !c[1].startsWith("env.") && isSet(merged, c[1]));
+  const allPrivOn = PRIVACY_ITEMS.every((i) => privacyOn(merged, i));
 
-    <div class="section"><div class="section-title">Preferences</div>
-      <div class="card"><div class="setting-grid">
-        ${SETTINGS_SELECTS.map(([k, l, o]) => settingSelect(k, l, o, getNested(merged, k))).join("")}
-        ${SETTINGS_TOGGLES.map(([k, l]) => settingToggle(k, l, !!getNested(merged, k))).join("")}
+  // Genuinely unknown top-level keys the user set by hand.
+  const otherKeys = Object.keys(merged).filter((k) => !CATALOG_TOP.has(k));
+
+  // "Add a setting" — known catalog settings (non-env) not yet set, grouped.
+  const groups = [];
+  for (const c of SETTING_CATALOG) {
+    if (c[1].startsWith("env.") || isSet(merged, c[1])) continue;
+    let g = groups.find((x) => x.name === c[0]);
+    if (!g) { g = { name: c[0], items: [] }; groups.push(g); }
+    g.items.push(c);
+  }
+
+  return `<div class="detail-inner">
+    <div class="page-head"><div><h1>Settings</h1><div class="ph-sub mono">${esc(s.home)}/settings.json</div></div>
+      <div class="page-actions"><button class="btn sm" data-action="open-settings-json">Open settings.json</button>
+        <button class="btn sm" data-action="open-folder" data-path="${esc(s.home)}">Open folder</button></div></div>
+
+    <div class="section"><div class="section-title">Privacy &amp; data
+      <button class="btn sm ${allPrivOn ? "" : "primary"}" data-action="privacy-apply-all" ${allPrivOn ? "disabled" : ""}>${allPrivOn ? "All protections on" : "Apply privacy-first defaults"}</button></div>
+      ${desc("Turn a protection on to write only that switch to settings.json; turn it off to remove it. Values are written verbatim as documented Claude Code settings and env vars.")}
+      <div class="card"><div class="setting-list">
+        ${PRIVACY_ITEMS.map((i) => privacyRow(merged, i)).join("")}
+      </div></div></div>
+
+    <div class="section"><div class="section-title">Active settings
+      ${activeKnown.length || otherKeys.length ? `<span class="faint" style="font-weight:400;font-size:11px">${activeKnown.length + otherKeys.length} set</span>` : ""}</div>
+      ${desc("Only settings you've actually set live in settings.json. Add more below; remove with ×.")}
+      <div class="card"><div class="setting-list">
+        ${activeKnown.map((c) => settingRow(c[1], getNested(merged, c[1]))).join("")}
+        ${otherKeys.map((k) => (scalar(merged[k]) ? settingRow(k, merged[k]) : complexRow(k, merged[k]))).join("")}
+        ${(activeKnown.length || otherKeys.length) ? "" : '<div class="faint" style="font-size:12px;padding:6px 2px">Nothing set yet — a clean slate. Add settings below.</div>'}
+      </div>
+      <div class="add-bar">
+        <select class="tune-select" data-role="add-setting">
+          <option value="">+ Add a setting…</option>
+          ${groups.map((g) => `<optgroup label="${esc(g.name)}">${g.items.map((c) => `<option value="${esc(c[1])}">${esc(c[2])}</option>`).join("")}</optgroup>`).join("")}
+        </select>
+        <span class="add-sep">or</span>
+        <input class="s-input" id="custom-key" placeholder="custom.key.path" style="max-width:180px">
+        <input class="s-input" id="custom-val" placeholder='value (JSON or text)' style="max-width:150px">
+        <button class="btn sm" data-action="add-custom">Add</button>
+      </div></div></div>
+
+    <div class="section"><div class="section-title">Environment variables</div>
+      ${desc("The env block Claude Code injects into every session. Add anything — DISABLE_TELEMETRY, ANTHROPIC_MODEL, proxies, timeouts.")}
+      <div class="card"><div class="setting-list">
+        ${Object.keys(env).length ? Object.entries(env).map(([name, val]) => `
+          <div class="setting-row">
+            <div class="s-main"><div class="s-label mono">${esc(name)}</div></div>
+            <div class="s-ctl"><input class="s-input" data-setting="env.${esc(name)}" data-type="envstr" value="${esc(val == null ? "" : val)}">
+              <button class="s-x" data-action="setting-remove" data-key="env.${esc(name)}" title="Remove">×</button></div>
+          </div>`).join("") : '<div class="faint" style="font-size:12px;padding:6px 2px">No environment variables set.</div>'}
+      </div>
+      <div class="add-bar">
+        <input class="s-input" id="env-name" list="known-env" placeholder="ENV_VAR_NAME" style="max-width:220px">
+        <input class="s-input" id="env-val" placeholder="value" style="max-width:160px">
+        <button class="btn sm" data-action="add-env">Add env var</button>
+        <span class="add-sep" style="margin-left:auto"></span>
+        <datalist id="known-env">${SETTING_CATALOG.filter((c) => c[1].startsWith("env.")).map((c) => `<option value="${esc(c[1].slice(4))}">`).join("")}</datalist>
       </div></div></div>
 
     <div class="section"><div class="section-title">Live statusline capture</div>
@@ -776,6 +974,59 @@ function liveStatuslinePanel(live) {
   return `<div style="margin-top:14px;display:flex;flex-direction:column;gap:8px">
     <div class="faint" style="font-size:11px">Live snapshot · ${esc((live.model && live.model.display_name) || "")} · captured ${fmt.rel(live._captured_mtime)}</div>
     ${rows.join("") || '<div class="faint">No meters in snapshot.</div>'}</div>`;
+}
+
+// Write one setting (value === null deletes it), then refetch so the "active"
+// list — and any server-side pruning of empty parents — stays authoritative.
+async function applySetting(key, value, quiet) {
+  const r = await call("updateSetting", key, JSON.stringify(value === undefined ? null : value));
+  if (r && r.ok) {
+    State.settings = await call("getSettings");
+    renderDetail();
+    if (!quiet) toast(value === null ? "Removed " + key.split(".").pop() : "Saved " + key.split(".").pop(), "ok");
+  } else toast("Update failed", "err");
+  return r && r.ok;
+}
+
+async function addCatalogSetting(key) {
+  const cat = CATALOG_BY_KEY[key];
+  const type = cat ? cat[3] : "string";
+  const def = type === "bool" ? true : type === "enum" ? cat[4][0]
+    : type === "number" ? 0 : type === "envflag" ? "1" : "";
+  await applySetting(key, def);
+}
+
+async function applyPrivacy(key, on) {
+  const item = PRIVACY_ITEMS.find((i) => i.key === key);
+  if (!item) return;
+  await applySetting(key, on ? item.private : null, true);
+  toast(on ? "Protection on" : "Protection off", "ok");
+}
+
+async function applyPrivacyDefaults() {
+  const items = PRIVACY_ITEMS.map((i) => ({ key: i.key, value: i.private }));
+  const r = await call("updateSettings", JSON.stringify(items));
+  if (r && r.ok) { State.settings = await call("getSettings"); renderDetail(); toast("Privacy-first defaults applied", "ok"); }
+  else toast("Failed", "err");
+}
+
+async function addCustomSetting() {
+  const kEl = document.getElementById("custom-key");
+  const vEl = document.getElementById("custom-val");
+  const key = (kEl && kEl.value || "").trim();
+  if (!key) { toast("Enter a key", "err"); return; }
+  let raw = (vEl && vEl.value || "").trim();
+  let value;
+  try { value = JSON.parse(raw); } catch { value = raw; }  // fall back to a plain string
+  await applySetting(key, value);
+}
+
+async function addCustomEnv() {
+  const nEl = document.getElementById("env-name");
+  const vEl = document.getElementById("env-val");
+  const name = (nEl && nEl.value || "").trim();
+  if (!name) { toast("Enter a variable name", "err"); return; }
+  await applySetting("env." + name, (vEl && vEl.value) || "");
 }
 
 /* ---------- monitor view ---------- */
@@ -820,6 +1071,363 @@ function monitorView() {
   </div>`;
 }
 
+/* ---------- cleanup / deletion helper ---------- */
+
+const PRESETS = [
+  ["empty", "Empty", "Sessions with 0 assistant replies — usually opened by mistake"],
+  ["small", "Small talk", "≤ 2 assistant replies — quick throwaway chats"],
+  ["cheap", "Under 1¢", "Cost below $0.01 — negligible sessions"],
+  ["old", "Older than 30d", "Not touched in the last 30 days"],
+  ["large10", "Largest 10", "The 10 biggest sessions on disk"],
+];
+
+function cleanupRec(s) {
+  return { pid: s.project_id, sid: s.session_id, title: s.title, cost: s.cost, bytes: (s.size_bytes || 0) + (s.extra_bytes || 0) };
+}
+
+function sortedCleanup(sessions) {
+  const arr = [...sessions];
+  if (State.cleanupSort === "age") arr.sort((a, b) => a.mtime - b.mtime);        // oldest first
+  else if (State.cleanupSort === "cost") arr.sort((a, b) => b.cost - a.cost);    // priciest first
+  else arr.sort((a, b) => (b.size_bytes + b.extra_bytes) - (a.size_bytes + a.extra_bytes)); // heaviest first
+  return arr;
+}
+
+function applyPreset(id) {
+  const list = ((State.cleanup && State.cleanup.sessions) || []).filter((s) => !s.active);
+  const now = Date.now();
+  clearSel();
+  let matched;
+  if (id === "large10") {
+    matched = [...list].sort((a, b) => (b.size_bytes + b.extra_bytes) - (a.size_bytes + a.extra_bytes)).slice(0, 10);
+  } else {
+    matched = list.filter((s) => {
+      const ageDays = (now - s.mtime * 1000) / 86400000;
+      if (id === "empty") return (s.assistant_messages || 0) === 0;
+      if (id === "small") return (s.assistant_messages || 0) <= 2;
+      if (id === "cheap") return (s.cost || 0) < 0.01;
+      if (id === "old") return ageDays > 30;
+      return false;
+    });
+  }
+  matched.forEach((s) => State.sel.set(selKey(s.project_id, s.session_id), cleanupRec(s)));
+  renderDetail();
+  if (!matched.length) toast("No sessions match that filter", "");
+}
+
+function cleanupView() {
+  const c = State.cleanup;
+  if (!c) return `<div class="detail-inner"><div class="skeleton">Scanning every session on disk…</div></div>`;
+  const list = sortedCleanup(c.sessions);
+  const t = selTotals();
+  const sort = State.cleanupSort;
+  const sortBtn = (k, l) => `<button class="chip ${sort === k ? "on" : ""}" data-action="cleanup-sort" data-sort="${k}">${l}</button>`;
+  return `<div class="detail-inner">
+    <div class="page-head"><div><h1>Cleanup</h1>
+      <div class="ph-sub">Reclaim disk space — multi-select old, small or heavy sessions and delete them together. Live sessions are protected.</div></div>
+      <div class="page-actions"><button class="btn sm" data-action="open-home" title="Open the Claude data folder">Open ~/.claude</button></div></div>
+    <div class="tiles">
+      ${tile("Sessions", c.sessions.length, fmt.bytes(c.total_bytes) + " on disk", false,
+        "Every transcript plus its ancillary data (tasks, file-history, images, session-env)")}
+      ${tile("Selected", t.count, fmt.cost(t.cost) + " of history", !!t.count, "Sessions currently checked for deletion")}
+      ${tile("Reclaims", fmt.bytes(t.bytes), t.count ? "delete + purge" : "nothing selected", !!t.count,
+        "Approximate disk space freed if you delete the current selection with purge on")}
+    </div>
+    <div class="section">
+      <div class="cleanup-toolbar">
+        <span class="tb-label">Quick select</span>
+        ${PRESETS.map(([id, l, tip]) => `<button class="chip" data-action="cleanup-preset" data-preset="${id}" title="${esc(tip)}">${l}</button>`).join("")}
+        <button class="chip" data-action="sel-all">All</button>
+        <button class="chip" data-action="sel-clear">None</button>
+        <span class="tb-label" style="margin-left:auto">Sort</span>
+        ${sortBtn("size", "Size")}${sortBtn("age", "Age")}${sortBtn("cost", "Cost")}
+      </div>
+      <div class="clean-list">
+        ${list.map(cleanupRow).join("") || '<div class="faint" style="padding:14px">No sessions on disk.</div>'}
+      </div>
+    </div>
+    ${selBar()}
+  </div>`;
+}
+
+function cleanupRow(s) {
+  const sel = isSel(s.project_id, s.session_id);
+  const size = (s.size_bytes || 0) + (s.extra_bytes || 0);
+  const tags = [];
+  if (s.active) tags.push('<span class="badge green"><span class="dot-active"></span> live</span>');
+  if (s.has_subagents) tags.push(badge("subagents", "magenta"));
+  return `<div class="clean-row ${sel ? "sel" : ""} ${s.active ? "live" : ""}" data-action="cleanup-row" data-pid="${esc(s.project_id)}" data-sid="${esc(s.session_id)}">
+    ${s.active ? '<span class="chk-lock" title="Live session — protected">🔒</span>' : `<input type="checkbox" class="chk" ${sel ? "checked" : ""} tabindex="-1">`}
+    <div class="cr-main">
+      <div class="cr-title">${esc(s.title)}</div>
+      <div class="cr-meta"><span class="cr-proj">${esc(s.project_name)}</span>
+        <span>${s.assistant_messages} turns</span><span>${s.tool_calls} tools</span>
+        <span>${fmt.rel(s.mtime)}</span>${tags.join("")}</div>
+    </div>
+    <div class="cr-nums"><span class="p-cost">${fmt.cost(s.cost)}</span><span class="cr-size">${fmt.bytes(size)}</span></div>
+  </div>`;
+}
+
+function selBar() {
+  const t = selTotals();
+  if (!t.count) return "";
+  return `<div class="sel-bar">
+    <div class="sb-info"><b>${t.count}</b> selected · <span class="p-cost">${fmt.cost(t.cost)}</span> · reclaims <b>${fmt.bytes(t.bytes)}</b></div>
+    <button class="btn sm" data-action="sel-clear">Clear</button>
+    <button class="btn sm primary danger" data-action="bulk-delete">Delete ${t.count} session${t.count === 1 ? "" : "s"}</button>
+  </div>`;
+}
+
+async function loadCleanup() {
+  State.cleanup = null; clearSel();
+  renderDetail();
+  State.cleanup = await call("getAllSessions");
+  renderDetail();
+}
+
+function confirmBulkDelete() {
+  const t = selTotals();
+  if (!t.count) return;
+  const items = selItems();
+  const extra = `<label class="checkbox-row"><input type="checkbox" id="bulk-purge" checked> Also purge tasks, file-history, image-cache &amp; env (reclaims more space)</label>`;
+  modal(`Delete ${t.count} session${t.count === 1 ? "" : "s"}?`,
+    `Permanently deletes ${t.count} transcript${t.count === 1 ? "" : "s"} — about ${fmt.cost(t.cost)} of history and ${fmt.bytes(t.bytes)} on disk. This cannot be undone.`,
+    async () => {
+      const purge = document.getElementById("bulk-purge") && document.getElementById("bulk-purge").checked;
+      const r = await call("deleteSessions", JSON.stringify(items), !!purge);
+      if (r && r.ok) {
+        toast(`Deleted ${r.deleted} session${r.deleted === 1 ? "" : "s"}`, "ok");
+        clearSel();
+        await loadOverview();
+        if (State.view === "cleanup") await loadCleanup();
+        else if (State.projectId) await selectProject(State.projectId);
+      } else toast("Delete failed", "err");
+    }, extra);
+}
+
+/* ---------- tune / assistant (drives the local `claude` CLI) ---------- */
+
+function projById(id) { return State.projects.find((p) => p.id === id); }
+
+// The sessions fed to the assistant as context: recent-first, capped. Scoped to
+// one project for Memory mode or project-scoped guidance, else machine-wide.
+function tuneContextItems() {
+  const t = State.tune;
+  let pool = (t.sessions || []).filter((s) => s.assistant_messages > 0);
+  if (t.mode === "memory" || t.scope === "project") pool = pool.filter((s) => s.project_id === t.projectId);
+  return [...pool].sort((a, b) => b.mtime - a.mtime).slice(0, 60);
+}
+
+async function loadTune() {
+  if (!State.tune) {
+    State.tune = {
+      mode: "guidance",       // guidance | memory
+      scope: "global",        // guidance only: global | project
+      projectId: (State.projects[0] || {}).id || "",
+      instruction: "",
+      sessions: null,         // every session on disk (context pool)
+      guidance: null,         // current CLAUDE.md for the chosen target
+      proposal: null,         // generated CLAUDE.md text (guidance mode)
+      notes: null,            // parsed memory notes (memory mode)
+      noteSel: new Set(),
+      busy: false, jobId: null, cost: 0, error: null,
+    };
+  }
+  renderDetail();
+  if (!State.tune.sessions) {
+    const all = await call("getAllSessions");
+    State.tune.sessions = (all && all.sessions) || [];
+  }
+  await tuneRefreshGuidance();
+  renderDetail();
+}
+
+// Load the CLAUDE.md that the current target (global or a project) would write to.
+async function tuneRefreshGuidance() {
+  const t = State.tune;
+  if (t.mode !== "guidance") return;
+  const proj = t.scope === "project" ? projById(t.projectId) : null;
+  const path = proj ? (proj.path || "") : "";
+  if (t.scope === "project" && !path) { t.guidance = { exists: false, content: "", path: "" }; return; }
+  t.guidance = await call("getGuidance", t.scope, path);
+}
+
+function tuneView() {
+  const t = State.tune;
+  if (!t) return `<div class="detail-inner"><div class="skeleton">Loading…</div></div>`;
+  const modeChip = (k, l) => `<button class="chip ${t.mode === k ? "on" : ""}" data-action="tune-mode" data-mode="${k}">${l}</button>`;
+  return `<div class="detail-inner">
+    <div class="page-head"><div><h1>Tune</h1>
+      <div class="ph-sub">Put your own signed-in Claude to work on your history — refine CLAUDE.md guidance or distill sessions into memory. Runs the local <span class="mono">claude</span> CLI; nothing leaves your machine beyond a normal Claude request.</div></div></div>
+    <div class="seg">${modeChip("guidance", "✦ Refine CLAUDE.md")}${modeChip("memory", "◇ Consolidate → memory")}</div>
+    ${t.mode === "guidance" ? tuneGuidance(t) : tuneMemory(t)}
+  </div>`;
+}
+
+function tuneProjectSelect(t) {
+  const opts = State.projects.map((p) => `<option value="${esc(p.id)}" ${p.id === t.projectId ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+  return `<select class="tune-select" data-tune="project">${opts || '<option value="">No projects</option>'}</select>`;
+}
+
+function tuneGuidance(t) {
+  const n = tuneContextItems().length;
+  const proj = t.scope === "project" ? projById(t.projectId) : null;
+  const where = t.scope === "global" ? "every project on this machine" : (proj ? proj.name : "this project");
+  const g = t.guidance || {};
+  const scopeChip = (k, l) => `<button class="chip ${t.scope === k ? "on" : ""}" data-action="tune-scope" data-scope="${k}">${l}</button>`;
+  const canRun = !t.busy && n > 0 && (t.scope === "global" || !!proj);
+  return `<div class="tune-form">
+    <div class="fld">
+      <label class="fld-label">Target file</label>
+      <div class="seg">${scopeChip("global", "Global · ~/.claude")}${scopeChip("project", "A project")}
+        ${t.scope === "project" ? tuneProjectSelect(t) : ""}</div>
+      <div class="tune-hint mono">${esc(g.path || (t.scope === "project" ? "select a project" : "~/.claude/CLAUDE.md"))} · ${g.exists ? `${(g.content || "").length} chars now` : "none yet — will be created"}</div>
+    </div>
+    <div class="fld">
+      <label class="fld-label">Instruction <span class="faint">(optional)</span></label>
+      <textarea class="tune-ta" id="tune-instruction" spellcheck="false" placeholder="Leave blank to let Claude fold in durable conventions and drop anything stale. Or steer it, e.g. “Emphasize our testing setup; remove the old build notes.”">${esc(t.instruction || "")}</textarea>
+    </div>
+    <div class="tune-hint">Context: the <b>${n}</b> most recent session${n === 1 ? "" : "s"} in ${esc(where)} (summaries only — never full transcripts).</div>
+    <div style="margin-top:14px">
+      <button class="btn primary" data-action="tune-run" ${canRun ? "" : "disabled"}>${t.busy ? "Working…" : "Generate CLAUDE.md"}</button>
+    </div>
+    ${tuneStatus(t)}
+    ${t.proposal != null ? tuneProposal(t, g) : ""}
+  </div>`;
+}
+
+function tuneProposal(t, g) {
+  const proj = t.scope === "project" ? projById(t.projectId) : null;
+  return `<div class="section" style="margin-top:18px">
+    <div class="section-title">Proposed CLAUDE.md
+      <span style="display:flex;gap:6px">
+        <button class="btn sm primary" data-action="tune-save">Save${g.exists ? " (overwrite)" : ""}</button>
+        <button class="btn sm" data-action="tune-run">Regenerate</button>
+      </span></div>
+    <textarea class="editor" id="tune-proposal" spellcheck="false">${esc(t.proposal)}</textarea>
+    <div class="tune-hint">Writes to <span class="mono">${esc(g.path || (proj ? proj.path + "/CLAUDE.md" : ""))}</span>${t.cost ? ` · this run cost ${fmt.cost(t.cost)}` : ""}. Edit freely before saving.</div>
+  </div>`;
+}
+
+function tuneMemory(t) {
+  const proj = projById(t.projectId);
+  const n = tuneContextItems().length;
+  const canRun = !t.busy && !!proj && n > 0;
+  return `<div class="tune-form">
+    <div class="fld">
+      <label class="fld-label">Project to distill into memory</label>
+      <div class="seg">${tuneProjectSelect(t)}</div>
+      <div class="tune-hint">Notes are written to this project's memory store (<span class="mono">${esc(proj ? proj.name : "—")}/memory</span>) and indexed in its MEMORY.md.</div>
+    </div>
+    <div class="tune-hint">Context: the <b>${n}</b> most recent session${n === 1 ? "" : "s"} in ${esc(proj ? proj.name : "—")} (summaries only).</div>
+    <div style="margin-top:14px">
+      <button class="btn primary" data-action="tune-run" ${canRun ? "" : "disabled"}>${t.busy ? "Distilling…" : "Distill memory notes"}</button>
+    </div>
+    ${tuneStatus(t)}
+    ${t.notes != null ? tuneNotes(t) : ""}
+  </div>`;
+}
+
+function tuneNotes(t) {
+  if (!t.notes.length) return `<div class="tune-hint" style="margin-top:14px">Claude found nothing durable worth saving from these sessions.</div>`;
+  const chosen = t.notes.filter((_, i) => t.noteSel.has(i)).length;
+  return `<div class="section" style="margin-top:18px">
+    <div class="section-title">${t.notes.length} proposed note${t.notes.length === 1 ? "" : "s"}
+      <button class="btn sm primary" data-action="tune-write-notes" ${chosen ? "" : "disabled"}>Write ${chosen} to memory</button></div>
+    ${t.notes.map((note, i) => {
+      const on = t.noteSel.has(i);
+      return `<div class="note-card ${on ? "" : "off"}" data-action="tune-note-toggle" data-i="${i}">
+        <input type="checkbox" class="chk" ${on ? "checked" : ""} tabindex="-1">
+        <div class="nc-main">
+          <div class="note-name">${esc(note.name)} ${note.type ? badge(note.type) : ""}</div>
+          ${note.description ? `<div class="note-desc">${esc(note.description)}</div>` : ""}
+          <div class="note-body">${esc(note.body)}</div>
+        </div></div>`;
+    }).join("")}
+    ${t.cost ? `<div class="tune-hint">This run cost ${fmt.cost(t.cost)}.</div>` : ""}
+  </div>`;
+}
+
+function tuneStatus(t) {
+  if (t.busy) return `<div class="tune-status"><span class="spinner"></span>Running <span class="mono">claude</span> on your history — this can take a bit…</div>`;
+  if (t.error) return `<div class="tune-err">⚠ ${esc(t.error)}</div>`;
+  return "";
+}
+
+// Persist whatever's in the instruction box into State before any re-render.
+function syncTuneInstruction() {
+  const ins = document.getElementById("tune-instruction");
+  if (ins && State.tune) State.tune.instruction = ins.value;
+}
+
+async function runTune() {
+  const t = State.tune;
+  if (t.busy) return;
+  syncTuneInstruction();
+  const items = tuneContextItems().map((s) => ({ project_id: s.project_id, session_id: s.session_id }));
+  if (!items.length) { toast("No sessions to learn from", "err"); return; }
+  t.busy = true; t.error = null; t.proposal = null; t.notes = null; t.cost = 0;
+  let req;
+  if (t.mode === "memory") {
+    const proj = projById(t.projectId);
+    if (!proj) { t.busy = false; toast("Pick a project", "err"); return; }
+    req = { kind: "consolidate", sessions: items, project_id: t.projectId, project_name: proj.name };
+  } else {
+    const proj = t.scope === "project" ? projById(t.projectId) : null;
+    req = { kind: "tune", scope: t.scope, sessions: items, instruction: t.instruction,
+            current_md: (t.guidance && t.guidance.content) || "", project_name: proj ? proj.name : "" };
+  }
+  renderDetail();
+  const r = await call("startAssistant", JSON.stringify(req));
+  if (!r || !r.ok) { t.busy = false; t.error = (r && r.error) || "Could not start the claude CLI."; renderDetail(); return; }
+  t.jobId = r.job_id;
+}
+
+// Async result of a startAssistant job, pushed from the bridge.
+function onAssistantEvent(json) {
+  let res; try { res = typeof json === "string" ? JSON.parse(json) : json; } catch { return; }
+  const t = State.tune;
+  if (!t || !res || res.job_id !== t.jobId) return;   // stale, or user navigated away
+  t.busy = false; t.jobId = null; t.cost = res.cost || 0;
+  if (!res.ok) { t.error = res.error || "The assistant failed."; renderDetail(); toast("Assistant error", "err"); return; }
+  if (res.kind === "consolidate") {
+    t.notes = res.notes || [];
+    t.noteSel = new Set(t.notes.map((_, i) => i));   // include all by default
+  } else {
+    t.proposal = res.text || "";
+    if (!t.proposal) t.error = "The assistant returned an empty document.";
+  }
+  renderDetail();
+}
+
+async function saveTuneGuidance() {
+  const t = State.tune;
+  const ta = document.getElementById("tune-proposal");
+  const content = ta ? ta.value : (t.proposal || "");
+  if (!content.trim()) { toast("Nothing to save", "err"); return; }
+  const proj = t.scope === "project" ? projById(t.projectId) : null;
+  const r = await call("saveGuidance", t.scope, content, proj ? (proj.path || "") : "");
+  if (r && r.ok) {
+    toast("Saved " + r.path.split("/").pop(), "ok");
+    t.guidance = { ok: true, exists: true, path: r.path, content };
+    t.proposal = null;
+    renderDetail();
+  } else toast(r && r.error ? "Save failed: " + r.error : "Save failed", "err");
+}
+
+async function writeTuneNotes() {
+  const t = State.tune;
+  const chosen = (t.notes || []).filter((_, i) => t.noteSel.has(i));
+  if (!chosen.length) { toast("No notes selected", "err"); return; }
+  const r = await call("writeMemoryNotes", t.projectId, JSON.stringify(chosen));
+  if (r && r.ok) {
+    toast(`Wrote ${r.count} note${r.count === 1 ? "" : "s"} to memory`, "ok");
+    t.notes = null; t.noteSel = new Set();
+    renderDetail();
+    await loadOverview();   // memory counts changed
+  } else toast("Write failed", "err");
+}
+
 /* ---------- shared ---------- */
 
 function emptyState(ic, title, sub) {
@@ -839,7 +1447,7 @@ async function loadOverview() {
 
 async function selectProject(id, { keepSession = false } = {}) {
   State.projectId = id;
-  if (!keepSession) { State.sessionId = null; State.detail = null; }
+  if (!keepSession) { State.sessionId = null; State.detail = null; State.selectMode = false; clearSel(); }
   State.view = State.view === "memory" ? "memory" : "project";
   const r = await call("getSessions", id);
   State.sessions = (r && r.sessions) || [];
@@ -921,6 +1529,59 @@ document.addEventListener("click", async (ev) => {
     case "open-jsonl": { const p = `${State.claudeHome}/projects/${State.projectId}/${State.sessionId}.jsonl`; await call("openInEditor", p); break; }
     case "refresh": { await loadOverview(); if (State.projectId) await selectProject(State.projectId, { keepSession: true }); toast("Refreshed", "ok"); break; }
     case "delete-session": return void confirmDeleteSession();
+    case "toggle-select": { State.selectMode = !State.selectMode; clearSel(); renderListPane(); break; }
+    case "session-toggle": {
+      const s = State.sessions.find((x) => x.session_id === t.dataset.id);
+      if (!s) break;
+      if (s.active) { toast("Live session — protected", "err"); break; }
+      toggleSel({ pid: State.projectId, sid: s.session_id, title: s.title, cost: s.cost, bytes: s.size_bytes || 0 });
+      keepScroll("list-pane", renderListPane);
+      break;
+    }
+    case "cleanup-row": {
+      const s = ((State.cleanup && State.cleanup.sessions) || []).find((x) => x.project_id === t.dataset.pid && x.session_id === t.dataset.sid);
+      if (!s) break;
+      if (s.active) { toast("Live session — protected from cleanup", "err"); break; }
+      toggleSel(cleanupRec(s));
+      keepScroll("detail-pane", renderDetail);
+      break;
+    }
+    case "cleanup-preset": return void applyPreset(t.dataset.preset);
+    case "cleanup-sort": { State.cleanupSort = t.dataset.sort; renderDetail(); break; }
+    case "tune-mode": {
+      if (State.tune.busy || State.tune.mode === t.dataset.mode) break;
+      syncTuneInstruction();
+      State.tune.mode = t.dataset.mode; State.tune.error = null;
+      await tuneRefreshGuidance(); renderDetail(); break;
+    }
+    case "tune-scope": {
+      if (State.tune.busy || State.tune.scope === t.dataset.scope) break;
+      syncTuneInstruction();
+      State.tune.scope = t.dataset.scope; State.tune.proposal = null; State.tune.error = null;
+      await tuneRefreshGuidance(); renderDetail(); break;
+    }
+    case "tune-run": return void runTune();
+    case "tune-save": return void saveTuneGuidance();
+    case "tune-write-notes": return void writeTuneNotes();
+    case "tune-note-toggle": {
+      const i = Number(t.dataset.i);
+      if (State.tune.noteSel.has(i)) State.tune.noteSel.delete(i); else State.tune.noteSel.add(i);
+      renderDetail(); break;
+    }
+    case "sel-all": {
+      if (State.view === "cleanup") {
+        ((State.cleanup && State.cleanup.sessions) || []).filter((s) => !s.active)
+          .forEach((s) => State.sel.set(selKey(s.project_id, s.session_id), cleanupRec(s)));
+        keepScroll("detail-pane", renderDetail);
+      } else {
+        State.sessions.filter((s) => !s.active)
+          .forEach((s) => State.sel.set(selKey(State.projectId, s.session_id), { pid: State.projectId, sid: s.session_id, title: s.title, cost: s.cost, bytes: s.size_bytes || 0 }));
+        keepScroll("list-pane", renderListPane);
+      }
+      break;
+    }
+    case "sel-clear": { clearSel(); if (State.view === "cleanup") keepScroll("detail-pane", renderDetail); else keepScroll("list-pane", renderListPane); break; }
+    case "bulk-delete": return void confirmBulkDelete();
     case "preview-file": return void previewFile(path);
     case "mem-file": { State._memFile = path; renderDetail(); const box = document.getElementById("mem-editor"); if (box) box.innerHTML = memoryEditor(path); break; }
     case "mem-save": return void saveMemory(path);
@@ -930,6 +1591,11 @@ document.addEventListener("click", async (ev) => {
     case "cfg-file": return void openConfigFile(path);
     case "cfg-save": return void saveConfigFile(path);
     case "cfg-view": return void viewFileModal(path);
+    case "setting-remove": return void applySetting(t.dataset.key, null);
+    case "add-custom": return void addCustomSetting();
+    case "add-env": return void addCustomEnv();
+    case "privacy-apply-all": return void applyPrivacyDefaults();
+    case "open-settings-json": { await call("openInEditor", `${State.claudeHome}/settings.json`); break; }
     case "show-earlier": {
       const tr = State.transcript;
       if (!tr || tr.start <= 0) break;
@@ -975,27 +1641,47 @@ async function viewFileModal(path) {
   });
 }
 
-/* settings toggles + dropdowns write immediately on change */
+/* tune project dropdown */
 document.addEventListener("change", async (ev) => {
+  const el = ev.target.closest("[data-tune='project']");
+  if (!el || !State.tune) return;
+  State.tune.projectId = el.value;
+  State.tune.proposal = null; State.tune.notes = null; State.tune.error = null;
+  await tuneRefreshGuidance();
+  renderDetail();
+});
+
+/* settings: privacy switches, add-a-setting picker, and every editable control
+   write straight to settings.json on change (empty text field = remove the key) */
+document.addEventListener("change", async (ev) => {
+  const pv = ev.target.closest("[data-role='privacy']");
+  if (pv) return void applyPrivacy(pv.dataset.key, pv.checked);
+  const add = ev.target.closest("[data-role='add-setting']");
+  if (add) { const k = add.value; add.value = ""; if (k) await addCatalogSetting(k); return; }
+
   const el = ev.target.closest("[data-setting]");
   if (!el) return;
   const key = el.dataset.setting;
-  const value = el.dataset.type === "bool" ? el.checked : el.value;
-  const r = await call("updateSetting", key, JSON.stringify(value));
-  if (r && r.ok) {
-    if (State.settings && State.settings.merged) setNested(State.settings.merged, key, value);
-    toast("Updated " + key.split(".").pop(), "ok");
-  } else toast("Update failed", "err");
+  const type = el.dataset.type;
+  let value;
+  if (type === "bool") value = el.checked;
+  else if (type === "envflag") value = el.checked ? "1" : null;
+  else if (type === "num") { const t = el.value.trim(); if (t === "") value = null; else { value = Number(t); if (Number.isNaN(value)) return void toast("Not a number", "err"); } }
+  else { const t = el.value; value = t === "" ? null : t; }   // str / enum / envstr — blank removes
+  await applySetting(key, value);
 });
 
 /* nav items */
 document.querySelectorAll(".nav-item").forEach((n) => n.addEventListener("click", () => {
   const v = n.dataset.view;
   State.view = v; State.projectId = null; State.sessionId = null; State.detail = null;
+  State.selectMode = false; clearSel();
   document.querySelectorAll(".nav-item").forEach((x) => x.classList.toggle("active", x === n));
   renderListPane();
   if (v === "settings") loadSettings();
   else if (v === "monitor") loadMonitor();
+  else if (v === "cleanup") loadCleanup();
+  else if (v === "tune") loadTune();
   else renderDetail();
 }));
 
@@ -1084,7 +1770,9 @@ function modal(title, body, onConfirm, extraHtml = "") {
   document.body.appendChild(back);
   back.addEventListener("click", (e) => {
     if (e.target === back || e.target.dataset.m === "cancel") back.remove();
-    else if (e.target.dataset.m === "ok") { back.remove(); onConfirm(); }
+    // Run the handler while the modal's own inputs (e.g. the purge checkbox)
+    // are still in the DOM, then tear the overlay down.
+    else if (e.target.dataset.m === "ok") { onConfirm(); back.remove(); }
   });
 }
 
@@ -1176,6 +1864,7 @@ function boot() {
   new QWebChannel(qt.webChannelTransport, async (channel) => {
     backend = channel.objects.backend;
     backend.dataChanged.connect(onDataChanged);
+    backend.assistantEvent.connect(onAssistantEvent);
     await loadOverview();
     renderListPane();
     renderDetail();
