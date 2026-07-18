@@ -46,10 +46,15 @@ class Watcher(QObject):
         self.fileEvent.emit(path)
 
     def start(self) -> None:
-        home = paths.claude_home()
-        if home.is_dir():
-            self._observer.schedule(self._handler, str(home), recursive=True)
-        self._observer.start()
+        # Never let a watch failure (e.g. UNC/network paths on Windows) kill
+        # the app — live updates degrade to manual refresh instead.
+        try:
+            home = paths.claude_home()
+            if home.is_dir():
+                self._observer.schedule(self._handler, str(home), recursive=True)
+            self._observer.start()
+        except Exception:
+            pass
 
     def watch_scratchpad(self, scratchpad_dir: str | None) -> None:
         """Watch a scratchpad directory in addition to the Claude home tree."""

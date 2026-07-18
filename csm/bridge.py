@@ -27,6 +27,7 @@ class Bridge(QObject):
         super().__init__()
         self._scanner = scanner
         self._watcher = watcher
+        self._window = None  # set by the application shell
         self._open_session: tuple[str, str] | None = None
         self._pending_reason: str | None = None
 
@@ -155,6 +156,18 @@ class Bridge(QObject):
     @Slot(str, str, result=str)
     def writeClaudeFile(self, path: str, content: str) -> str:
         return _j(actions.write_claude_file(path, content))
+
+    # -- window controls (WSLg title bars can be nearly invisible) ---------- #
+
+    @Slot()
+    def windowMinimize(self) -> None:
+        if self._window is not None:
+            self._window.showMinimized()
+
+    @Slot()
+    def windowClose(self) -> None:
+        if self._window is not None:
+            self._window.close()
 
     @Slot(result=str)
     def statuslineStatus(self) -> str:

@@ -100,6 +100,7 @@ body {
   transition: all .15s;
 }
 .icon-btn:hover { background: var(--bg-hover); color: var(--text); border-color: var(--accent); }
+.icon-btn.win-close:hover { border-color: var(--red); color: var(--red); }
 
 /* ---------- Body layout ---------- */
 .body { flex: 1; display: flex; min-height: 0; }

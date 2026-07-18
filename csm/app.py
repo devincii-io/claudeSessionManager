@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
         self._scanner = Scanner()
         self._watcher = Watcher()
         self._bridge = Bridge(self._scanner, self._watcher)
+        self._bridge._window = self
 
         self._view = QWebEngineView(self)
         self._view.page().setBackgroundColor(QColor("#1b1a17"))

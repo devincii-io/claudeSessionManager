@@ -969,6 +969,10 @@ document.getElementById("refresh-btn").addEventListener("click", async () => {
   if (State.projectId) await selectProject(State.projectId, { keepSession: true });
 });
 
+/* window controls — WSLg's native title bar is easy to miss */
+document.getElementById("win-min").addEventListener("click", () => backend && backend.windowMinimize());
+document.getElementById("win-close").addEventListener("click", () => backend && backend.windowClose());
+
 document.getElementById("search").addEventListener("input", (e) => {
   State.search = e.target.value;
   renderRail(); renderListPane();
