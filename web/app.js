@@ -249,10 +249,49 @@ function renderDetail() {
   const el = document.getElementById("detail-pane");
   if (State.view === "settings") return void (el.innerHTML = settingsView());
   if (State.view === "monitor") return void (el.innerHTML = monitorView());
+  if (State.view === "search") return void (el.innerHTML = searchView());
   if (State.view === "memory") return void (el.innerHTML = memoryView());
   if (State.view === "session" && State.detail) return void (el.innerHTML = sessionView());
   if (State.projectId) return void (el.innerHTML = projectView());
   el.innerHTML = overviewView();
+}
+
+/* ---------- global search view ---------- */
+
+function searchView() {
+  const r = State.searchResults;
+  if (!r) return `<div class="detail-inner"><div class="skeleton">Searching…</div></div>`;
+  const sess = r.sessions || [];
+  const prompts = r.prompts || [];
+  return `<div class="detail-inner">
+    <div class="page-head"><div><h1>Search: “${esc(State.searchQuery)}”</h1>
+      <div class="ph-sub">${sess.length} sessions · ${prompts.length} prompts (Esc to clear)</div></div></div>
+    ${sess.length ? `<div class="section"><div class="section-title">Sessions</div>
+      <div class="list-body" style="padding:0">${sess.map((x) => `
+        <div class="file-row" data-action="goto-session" data-pid="${esc(x.project_id)}" data-sid="${esc(x.session_id)}">
+          <div class="file-ic">◈</div>
+          <div style="min-width:0"><div class="f-name">${esc(x.title || x.session_id)}</div>
+          <div class="f-desc">${esc(x.project_name)} · ${fmt.rel(x.mtime)}</div></div>
+          <div class="file-meta">${fmt.cost(x.cost)}</div>
+        </div>`).join("")}</div></div>` : ""}
+    ${prompts.length ? `<div class="section"><div class="section-title">Prompt history</div>
+      <div class="list-body" style="padding:0">${prompts.map((x) => `
+        <div class="file-row" data-action="goto-session" data-pid="${esc(x.project_id)}" data-sid="${esc(x.session_id)}">
+          <div class="file-ic">›_</div>
+          <div style="min-width:0"><div class="f-name" style="font-weight:400">${esc(x.display)}</div>
+          <div class="f-desc">${esc(x.project_name)} · ${fmt.rel(x.timestamp)}</div></div>
+        </div>`).join("")}</div></div>` : ""}
+    ${!sess.length && !prompts.length ? emptyState("🔎", "No matches", "Nothing found across sessions or prompt history.") : ""}
+  </div>`;
+}
+
+async function runGlobalSearch(q) {
+  State.view = "search";
+  State.searchQuery = q;
+  State.searchResults = null;
+  renderListPane(); renderDetail();
+  State.searchResults = await call("searchAll", q);
+  renderDetail();
 }
 
 /* ---------- overview dashboard ---------- */
@@ -334,7 +373,8 @@ function sessionView() {
     ["analytics", "Analytics"],
     ["subagents", "Subagents"],
     ["tasks", "Tasks (" + (d.tasks || []).length + ")"],
-    ["scratchpad", "Scratchpad (" + ((d.scratchpad && d.scratchpad.files || []).length) + ")"],
+    ["scratchpad", "Workspace (" + ((d.scratchpad && d.scratchpad.files || []).length) + ")"],
+    ["images", "Images (" + ((d.images || []).length) + ")"],
     ["raw", "Raw"],
   ];
   return `<div class="detail-inner">
@@ -342,6 +382,7 @@ function sessionView() {
       <div><h1>${esc(title)}</h1>
         <div class="ph-sub mono">${esc(State.sessionId)} · ${(s.models || []).map(shortModel).join(", ")}</div></div>
       <div class="page-actions">
+        <button class="btn sm" data-action="copy-resume" title="Copy: claude --resume">Copy resume</button>
         <button class="btn sm" data-action="open-jsonl">Open .jsonl</button>
         <button class="btn sm danger" data-action="delete-session">Delete</button>
       </div>
@@ -357,8 +398,19 @@ function sessionTabBody() {
   if (State.tab === "subagents") return subagentsTab(d);
   if (State.tab === "tasks") return tasksTab(d);
   if (State.tab === "scratchpad") return scratchpadTab(d);
+  if (State.tab === "images") return imagesTab(d);
   if (State.tab === "raw") return rawTab(d);
   return transcriptTab(d);
+}
+
+function imagesTab(d) {
+  const imgs = d.images || [];
+  if (!imgs.length) return emptyState("🖼", "No images", "No pasted images cached for this session.");
+  return `<div class="img-grid">${imgs.map((f) => `
+    <figure class="img-card" data-action="open-folder" data-path="${esc(f.path)}" title="${esc(f.name)} · ${fmt.bytes(f.size)}">
+      <img src="file://${esc(f.path)}" loading="lazy" alt="${esc(f.name)}">
+      <figcaption>${esc(f.name)} <span class="faint">${fmt.bytes(f.size)}</span></figcaption>
+    </figure>`).join("")}</div>`;
 }
 
 const NOISE_RE = /^<(local-command-caveat|local-command-stdout|command-name|command-message|command-args|system-reminder|bash-(input|stdout|stderr))/;
@@ -376,9 +428,16 @@ function transcriptTab(d) {
   const toggle = hidden
     ? `<button class="btn sm" data-action="toggle-noise" style="margin-bottom:12px">${State.showNoise ? "Hide" : "Show"} ${hidden} system / slash-command message${hidden === 1 ? "" : "s"}</button>`
     : "";
+  // Window the DOM: only render the most recent slice for fast paint on huge sessions.
+  const limit = State.transcriptLimit || 250;
+  const shown = events.slice(-limit);
+  const earlier = events.length - shown.length;
+  const earlierBtn = earlier > 0
+    ? `<button class="btn sm" data-action="show-earlier" style="margin-bottom:12px;margin-left:6px">Load ${Math.min(earlier, 500)} earlier (${earlier} hidden)</button>`
+    : "";
   return `${d.truncated ? '<div class="truncated-note" style="margin-bottom:10px">Showing the most recent messages (large session truncated for performance).</div>' : ""}
-    ${toggle}
-    <div class="transcript">${events.map(renderMessage).join("")}</div>`;
+    ${toggle}${earlierBtn}
+    <div class="transcript">${shown.map(renderMessage).join("")}</div>`;
 }
 
 function renderMessage(e) {
@@ -475,15 +534,20 @@ function scratchpadTab(d) {
 }
 
 function rawTab(d) {
-  const path = (State.projects.find((p) => p.id === State.projectId) || {});
   const jsonl = `${State.claudeHome || ""}/projects/${State.projectId}/${State.sessionId}.jsonl`;
+  const fh = d.file_history || {};
   return `<div class="card">
     <div class="kv">
       <div class="k">Session ID</div><div class="v">${esc(State.sessionId)}</div>
       <div class="k">Transcript</div><div class="v">${esc(jsonl)}</div>
       <div class="k">Events (shown)</div><div class="v">${(d.events || []).length}${d.truncated ? " (truncated)" : ""}</div>
+      <div class="k">File checkpoints</div><div class="v">${fh.count || 0} snapshots · ${fmt.bytes(fh.bytes)}</div>
+      <div class="k">Resume</div><div class="v">claude --resume ${esc(State.sessionId)}</div>
     </div>
-    <div style="margin-top:14px"><button class="btn" data-action="open-jsonl">Open transcript in editor</button></div>
+    <div style="margin-top:14px;display:flex;gap:8px">
+      <button class="btn" data-action="open-jsonl">Open transcript in editor</button>
+      ${fh.count ? `<button class="btn" data-action="open-folder" data-path="${esc(fh.dir)}">Open checkpoints</button>` : ""}
+    </div>
   </div>`;
 }
 
@@ -633,8 +697,11 @@ function monitorView() {
   const active = [];
   State.projects.forEach((p) => { if (p.active_count) active.push(p); });
   const live = State.settings && State.settings.live;
+  const shells = State.shells || {};
+  const snaps = shells.snapshots || [];
+  const envs = shells.envs || [];
   return `<div class="detail-inner">
-    <div class="page-head"><div><h1>Monitor</h1><div class="ph-sub">Live sessions and context pressure</div></div>
+    <div class="page-head"><div><h1>Monitor</h1><div class="ph-sub">Live sessions, shells and context pressure</div></div>
       <div class="page-actions"><button class="btn sm" data-action="refresh">Refresh</button></div></div>
     ${live ? `<div class="section"><div class="section-title">Live statusline</div><div class="card">${liveStatuslinePanel(live)}</div></div>` : ""}
     <div class="section"><div class="section-title">Active projects (${active.length})</div>
@@ -644,7 +711,21 @@ function monitorView() {
           <span class="faint" style="font-size:11.5px">${p.active_count} active · ${fmt.rel(p.last_activity)}</span>
           <span style="margin-left:auto" class="p-cost">${fmt.cost(p.total_cost)}</span></div>`).join("")
         : '<div class="faint" style="font-size:12px">No sessions active in the last 2 minutes.</div>'}</div></div>
-    <div class="section"><div class="section-title">All projects — context load</div>
+    <div class="section"><div class="section-title">Shell snapshots (${snaps.length})</div>
+      <div class="card">${snaps.length ? snaps.map((f) => `
+        <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border-soft);font-size:12px">
+          <span class="mono dim">${esc(f.name)}</span>
+          <span class="faint" style="margin-left:auto;font-size:11px">${fmt.bytes(f.size)} · ${fmt.rel(f.mtime)}</span>
+          <button class="btn sm" data-action="cfg-view" data-path="${esc(f.path)}">View</button></div>`).join("")
+        : '<div class="faint" style="font-size:12px">No shell snapshots.</div>'}</div></div>
+    <div class="section"><div class="section-title">Session environments (${envs.length})</div>
+      <div class="card">${envs.length ? envs.map((e) => `
+        <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border-soft);font-size:12px">
+          <span class="mono dim">${esc(e.session_id)}</span>
+          <span class="faint" style="margin-left:auto;font-size:11px">${fmt.rel(e.mtime)}</span>
+          <button class="btn sm" data-action="open-folder" data-path="${esc(e.path)}">Open</button></div>`).join("")
+        : '<div class="faint" style="font-size:12px">No session environments.</div>'}</div></div>
+    <div class="section"><div class="section-title">All projects — spend</div>
       <div class="card chart-bars">${State.projects.map((p) => `
         <div class="bar-row"><span class="bar-label">${esc(p.name)}</span>
           <span>${meterRow("", Math.min(100, p.total_cost), fmt.cost(p.total_cost))}</span>
@@ -676,13 +757,19 @@ async function selectProject(id, { keepSession = false } = {}) {
   if (State.view === "memory") loadMemory(id);
 }
 
+function detailSig(d) {
+  return ((d.events || []).length) + ":" + (((d.usage || {}).total) || 0) + ":" + ((d.scratchpad && d.scratchpad.files || []).length);
+}
+
 async function selectSession(sid) {
   State.sessionId = sid;
   State.view = "session";
   State.tab = "transcript";
+  State.transcriptLimit = 250;
   document.getElementById("detail-pane").innerHTML = `<div class="detail-inner"><div class="skeleton">Loading session…</div></div>`;
   const d = await call("getSessionDetail", State.projectId, sid);
   State.detail = d || {};
+  State._detailSig = detailSig(State.detail);
   renderListPane(); renderDetail();
 }
 
@@ -752,8 +839,45 @@ document.addEventListener("click", async (ev) => {
     case "statusline-uninstall": { await call("uninstallStatusline"); State.statuslineStatus = await call("statuslineStatus"); renderDetail(); toast("Capture removed", "ok"); break; }
     case "cfg-file": return void openConfigFile(path);
     case "cfg-save": return void saveConfigFile(path);
+    case "cfg-view": return void viewFileModal(path);
+    case "show-earlier": {
+      State.transcriptLimit = (State.transcriptLimit || 250) + 500;
+      document.getElementById("tab-body").innerHTML = sessionTabBody();
+      break;
+    }
+    case "copy-resume": {
+      const cmd = `claude --resume ${State.sessionId}`;
+      try { await navigator.clipboard.writeText(cmd); toast("Copied: " + cmd, "ok"); }
+      catch { const ta = document.createElement("textarea"); ta.value = cmd; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); toast("Copied: " + cmd, "ok"); }
+      break;
+    }
+    case "goto-session": {
+      const pid = t.dataset.pid, sid = t.dataset.sid;
+      if (!pid) { toast("Unknown project for this entry", "err"); break; }
+      State.search = ""; document.getElementById("search").value = "";
+      await selectProject(pid);
+      if (sid) await selectSession(sid);
+      break;
+    }
   }
 });
+
+async function viewFileModal(path) {
+  const r = await call("readFile", path);
+  const back = document.createElement("div");
+  back.className = "modal-back";
+  back.innerHTML = `<div class="modal" style="width:760px;max-width:92vw">
+    <h3 class="mono" style="font-size:13px">${esc(path.split("/").pop())}</h3>
+    <pre class="code" style="max-height:60vh;overflow:auto;margin:12px 0">${esc(r && r.ok ? r.content : "Could not read file.")}</pre>
+    <div class="modal-actions">
+      <button class="btn" data-m="open">Open externally</button>
+      <button class="btn primary" data-m="cancel">Close</button></div></div>`;
+  document.body.appendChild(back);
+  back.addEventListener("click", async (e) => {
+    if (e.target === back || e.target.dataset.m === "cancel") back.remove();
+    else if (e.target.dataset.m === "open") { await call("openInEditor", path); back.remove(); }
+  });
+}
 
 /* settings toggles + dropdowns write immediately on change */
 document.addEventListener("change", async (ev) => {
@@ -775,9 +899,17 @@ document.querySelectorAll(".nav-item").forEach((n) => n.addEventListener("click"
   document.querySelectorAll(".nav-item").forEach((x) => x.classList.toggle("active", x === n));
   renderListPane();
   if (v === "settings") loadSettings();
-  else if (v === "monitor") { loadSettings(); renderDetail(); }
+  else if (v === "monitor") loadMonitor();
   else renderDetail();
 }));
+
+async function loadMonitor() {
+  renderDetail();
+  const [settings, shells] = await Promise.all([call("getSettings"), call("getShells")]);
+  State.settings = settings || State.settings;
+  State.shells = shells || State.shells;
+  renderDetail();
+}
 
 document.getElementById("refresh-btn").addEventListener("click", async () => {
   await loadOverview();
@@ -787,6 +919,16 @@ document.getElementById("refresh-btn").addEventListener("click", async () => {
 document.getElementById("search").addEventListener("input", (e) => {
   State.search = e.target.value;
   renderRail(); renderListPane();
+});
+
+document.getElementById("search").addEventListener("keydown", (e) => {
+  const q = e.target.value.trim();
+  if (e.key === "Enter" && q) runGlobalSearch(q);
+  else if (e.key === "Escape") {
+    e.target.value = ""; State.search = "";
+    if (State.view === "search") { State.view = State.projectId ? "project" : "overview"; }
+    renderRail(); renderListPane(); renderDetail();
+  }
 });
 
 /* ---------- actions requiring UI ---------- */
@@ -859,10 +1001,23 @@ function toast(msg, kind = "") {
 /* ---------- live updates ---------- */
 
 let liveTimer = null;
-function onDataChanged() {
+function onDataChanged(reason) {
   const dot = document.getElementById("live-dot");
   dot.classList.add("flash");
   setTimeout(() => dot.classList.remove("flash"), 600);
+
+  if (reason === "statusline") {
+    // Cheap path: only refresh the live meters, never a full rescan.
+    clearTimeout(State._slTimer);
+    State._slTimer = setTimeout(async () => {
+      if (State.view === "monitor" || State.view === "settings") {
+        const live = await call("getStatuslineLive");
+        if (live && Object.keys(live).length && State.settings) { State.settings.live = live; renderDetail(); }
+      }
+    }, 250);
+    return;
+  }
+
   clearTimeout(liveTimer);
   liveTimer = setTimeout(async () => {
     await loadOverview();
@@ -871,14 +1026,24 @@ function onDataChanged() {
       State.sessions = (r && r.sessions) || [];
       renderListPane();
     } else if (State.view === "session" && State.sessionId) {
-      // Refresh session list meta but keep the transcript unless active.
       const r = await call("getSessions", State.projectId);
       State.sessions = (r && r.sessions) || [];
       const s = State.sessions.find((x) => x.session_id === State.sessionId);
-      if (s && s.active) { const d = await call("getSessionDetail", State.projectId, State.sessionId); State.detail = d || State.detail; renderDetail(); }
+      if (s && s.active) {
+        const d = await call("getSessionDetail", State.projectId, State.sessionId);
+        // Skip the (expensive) re-render when nothing actually changed.
+        if (d && detailSig(d) !== State._detailSig) {
+          State._detailSig = detailSig(d);
+          State.detail = d;
+          renderDetail();
+        }
+      }
       renderListPane();
-    } else if (State.view === "monitor") { renderDetail(); }
-  }, 400);
+    } else if (State.view === "monitor") {
+      State.shells = await call("getShells");
+      renderDetail();
+    }
+  }, 300);
 }
 
 /* ---------- boot ---------- */
