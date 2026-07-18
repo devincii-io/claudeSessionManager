@@ -1,12 +1,19 @@
 # Claude Session Manager
 
 A modern, fast desktop app for exploring everything **Claude Code** stores on your
-machine — sessions, memory, subagents, scratchpads, tasks, settings and live
-state — all grouped by project and richly visualized. Built with **PySide6** +
-**QtWebEngine** (an HTML/CSS/JS frontend for a beautiful, extensible UI) and
-managed with **uv**. Cross-platform: Linux and Windows.
+machine — sessions, memory, subagents, scratchpads, tasks, images, shells,
+settings and live state — all grouped by project and richly visualized. Built
+with **PySide6** + **QtWebEngine** (an HTML/CSS/JS frontend for a beautiful,
+extensible UI) and managed with **uv**. Cross-platform: Linux and Windows.
 
 ![Claude Session Manager](docs/screenshot.png)
+
+**Fast by design:** `orjson` parsing (a cold 10 MB transcript summarizes in
+~40 ms), disk-cached summaries keyed by mtime+size, and *incremental* parsing —
+while a session is live, only the newly appended bytes are read (~0.1 ms per
+refresh), never the whole file. The transcript DOM is windowed to the most
+recent messages, and statusline ticks are routed on a cheap path that never
+triggers a rescan.
 
 ## What it shows
 
@@ -32,6 +39,15 @@ managed with **uv**. Cross-platform: Linux and Windows.
 - **Live statusline capture** (opt-in) — rate limits (5h / 7d) and live context %
   are only handed to your statusline command by Claude Code and aren't stored on
   disk. An optional, removable one-line hook lets the app read the latest values.
+- **Global search** — press Enter in the search box to search every session
+  (titles, first prompts) *and* your full prompt history, with jump-to-session.
+- **Image gallery** — pasted images from the session image cache, as thumbnails.
+- **Workspace** — the per-session scratchpad *and* background-task outputs.
+- **Shells & environments** — shell snapshots and session-env dirs in Monitor.
+- **Settings as controls** — toggles and dropdowns writing straight to
+  `settings.json`, plus an in-app editor for small config files
+  (`statusline-command.sh`, `settings.json`, commands, agents…).
+- **Copy resume** — one click copies `claude --resume <session-id>`.
 
 Buttons throughout open paths in **VS Code** or your file manager, and sessions /
 memory can be **deleted** (with confirmation).
