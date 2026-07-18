@@ -88,9 +88,10 @@ body {
 #search::placeholder { color: var(--text-faint); }
 
 .topbar-right { display: flex; align-items: center; gap: 10px; min-width: 130px; justify-content: flex-end; -webkit-app-region: no-drag; }
-.live-dot { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
-.live-dot .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
-.live-dot.flash .pulse { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+.live-dot { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; cursor: default; }
+.live-dot .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+.live-dot.flash { color: var(--yellow); }
+.live-dot.flash .pulse { background: var(--yellow); box-shadow: 0 0 10px var(--yellow); animation: pulse .8s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
 
 .icon-btn {

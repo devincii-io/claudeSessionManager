@@ -19,8 +19,8 @@
         <input id="search" type="text" placeholder="Filter… (Enter = search all sessions & prompt history)" autocomplete="off" spellcheck="false" />
       </div>
       <div class="topbar-right">
-        <div id="live-dot" class="live-dot" title="Live filesystem watch active">
-          <span class="pulse"></span> live
+        <div id="live-dot" class="live-dot" title="Watching ~/.claude for changes — turns amber whenever Claude Code writes to disk">
+          <span class="pulse"></span> <span id="live-label">watching</span>
         </div>
         <button id="refresh-btn" class="icon-btn" title="Refresh">⟳</button>
       </div>

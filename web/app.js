@@ -1001,10 +1001,22 @@ function toast(msg, kind = "") {
 /* ---------- live updates ---------- */
 
 let liveTimer = null;
-function onDataChanged(reason) {
+
+/* Steady green "watching" while idle; amber "activity" while Claude writes to disk. */
+function indicateActivity() {
   const dot = document.getElementById("live-dot");
+  const label = document.getElementById("live-label");
   dot.classList.add("flash");
-  setTimeout(() => dot.classList.remove("flash"), 600);
+  if (label) label.textContent = "activity";
+  clearTimeout(indicateActivity._t);
+  indicateActivity._t = setTimeout(() => {
+    dot.classList.remove("flash");
+    if (label) label.textContent = "watching";
+  }, 1200);
+}
+
+function onDataChanged(reason) {
+  indicateActivity();
 
   if (reason === "statusline") {
     // Cheap path: only refresh the live meters, never a full rescan.
