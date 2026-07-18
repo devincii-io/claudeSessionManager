@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Claude Session Manager</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- Top bar -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <span class="brand-name">Claude<span class="brand-thin"> Session Manager</span></span>
+      </div>
+      <div class="search-wrap">
+        <input id="search" type="text" placeholder="Search projects, sessions, memory…" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="topbar-right">
+        <div id="live-dot" class="live-dot" title="Live filesystem watch active">
+          <span class="pulse"></span> live
+        </div>
+        <button id="refresh-btn" class="icon-btn" title="Refresh">⟳</button>
+      </div>
+    </header>
+
+    <div class="body">
+      <!-- Rail: nav + projects -->
+      <nav class="rail">
+        <div class="nav-group">
+          <button class="nav-item active" data-view="overview">
+            <span class="nav-ic">◈</span> Overview
+          </button>
+          <button class="nav-item" data-view="settings">
+            <span class="nav-ic">⚙</span> Settings
+          </button>
+          <button class="nav-item" data-view="monitor">
+            <span class="nav-ic">◉</span> Monitor
+          </button>
+        </div>
+        <div class="rail-label">Projects</div>
+        <div id="project-list" class="project-list"></div>
+      </nav>
+
+      <!-- Middle list pane -->
+      <section id="list-pane" class="list-pane"></section>
+
+      <!-- Main detail pane -->
+      <main id="detail-pane" class="detail-pane"></main>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
