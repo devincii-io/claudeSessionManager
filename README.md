@@ -10,14 +10,25 @@ settings and live state — all grouped by project and richly visualized. Built
 with **PySide6** + **QtWebEngine** (an HTML/CSS/JS frontend for a beautiful,
 extensible UI) and managed with **uv**. Cross-platform: Linux and Windows.
 
-![Claude Session Manager](docs/screenshot.png)
+![Session analytics](docs/screenshot.png)
+
+| Overview | Transcript |
+|---|---|
+| ![Overview](docs/overview.png) | ![Transcript](docs/transcript.png) |
+
+*(Screenshots show generated demo data.)*
 
 **Fast by design:** `orjson` parsing (a cold 10 MB transcript summarizes in
 ~40 ms), disk-cached summaries keyed by mtime+size, and *incremental* parsing —
 while a session is live, only the newly appended bytes are read (~0.1 ms per
-refresh), never the whole file. The transcript DOM is windowed to the most
-recent messages, and statusline ticks are routed on a cheap path that never
-triggers a rescan.
+refresh), never the whole file. Transcripts are **paged**: the backend serves a
+small window of messages and loads earlier pages on demand, so even a 100 MB
+session opens instantly on every tab; live sessions append only newly written
+events. Statusline ticks are routed on a cheap path that never triggers a
+rescan.
+
+Docs: [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
+[LICENSE](LICENSE) · [vendor/NOTICE](vendor/NOTICE)
 
 ## What it shows
 
