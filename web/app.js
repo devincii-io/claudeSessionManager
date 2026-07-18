@@ -369,9 +369,9 @@ function sessionView() {
   const s = State.sessions.find((x) => x.session_id === State.sessionId) || {};
   const title = s.title || s.first_prompt || "Session";
   const tabs = [
-    ["transcript", "Transcript"],
     ["analytics", "Analytics"],
-    ["subagents", "Subagents"],
+    ["transcript", "Transcript (" + (d.total_events || 0) + ")"],
+    ["subagents", "Subagents (" + ((d.subagents && d.subagents.count) || 0) + ")"],
     ["tasks", "Tasks (" + (d.tasks || []).length + ")"],
     ["scratchpad", "Workspace (" + ((d.scratchpad && d.scratchpad.files || []).length) + ")"],
     ["images", "Images (" + ((d.images || []).length) + ")"],
@@ -420,24 +420,21 @@ function isNoiseUser(e) {
   return !!txt && NOISE_RE.test(txt);
 }
 
-function transcriptTab(d) {
-  const all = (d.events || []).filter((e) => !e.sidechain);
+function transcriptTab() {
+  // Paged: the backend only ever sends a window of events, never the full log.
+  const t = State.transcript || { events: [], start: 0, total: 0 };
+  const all = t.events.filter((e) => !e.sidechain);
   const events = State.showNoise ? all : all.filter((e) => !isNoiseUser(e));
   const hidden = all.length - events.length;
-  if (!events.length && !hidden) return emptyState("◌", "No messages");
+  if (!events.length && !hidden && !t.start) return emptyState("◌", "No messages");
   const toggle = hidden
     ? `<button class="btn sm" data-action="toggle-noise" style="margin-bottom:12px">${State.showNoise ? "Hide" : "Show"} ${hidden} system / slash-command message${hidden === 1 ? "" : "s"}</button>`
     : "";
-  // Window the DOM: only render the most recent slice for fast paint on huge sessions.
-  const limit = State.transcriptLimit || 250;
-  const shown = events.slice(-limit);
-  const earlier = events.length - shown.length;
-  const earlierBtn = earlier > 0
-    ? `<button class="btn sm" data-action="show-earlier" style="margin-bottom:12px;margin-left:6px">Load ${Math.min(earlier, 500)} earlier (${earlier} hidden)</button>`
+  const earlierBtn = t.start > 0
+    ? `<button class="btn sm" data-action="show-earlier" style="margin-bottom:12px;margin-left:6px">Load earlier (${t.start} before this)</button>`
     : "";
-  return `${d.truncated ? '<div class="truncated-note" style="margin-bottom:10px">Showing the most recent messages (large session truncated for performance).</div>' : ""}
-    ${toggle}${earlierBtn}
-    <div class="transcript">${shown.map(renderMessage).join("")}</div>`;
+  return `${toggle}${earlierBtn}
+    <div class="transcript">${events.map(renderMessage).join("")}</div>`;
 }
 
 function renderMessage(e) {
@@ -463,21 +460,65 @@ function renderBlock(b) {
   return "";
 }
 
+function columns(values, color = "#d97757", labels = null, h = 74) {
+  // Compact column chart (svg) for histograms.
+  const max = Math.max(1, ...values);
+  const n = values.length;
+  const w = 480, gap = 2, bw = (w - gap * n) / n;
+  const bars = values.map((v, i) => {
+    const bh = Math.max(v > 0 ? 2 : 0, (v / max) * (h - 16));
+    return `<rect x="${(i * (bw + gap)).toFixed(1)}" y="${(h - 14 - bh).toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="1.5" fill="${color}" opacity="${v ? 0.9 : 0.25}"><title>${labels ? labels[i] + ": " : ""}${v}</title></rect>`;
+  }).join("");
+  const ticks = labels
+    ? labels.map((l, i) => (i % Math.ceil(n / 8) === 0 ? `<text x="${(i * (bw + gap) + bw / 2).toFixed(1)}" y="${h - 3}" font-size="8" fill="#726c61" text-anchor="middle">${esc(String(l))}</text>` : "")).join("")
+    : "";
+  return `<svg width="100%" height="${h}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}${ticks}</svg>`;
+}
+
+function durationText(a, b) {
+  const t0 = Date.parse(a), t1 = Date.parse(b);
+  if (isNaN(t0) || isNaN(t1) || t1 <= t0) return "—";
+  const m = Math.round((t1 - t0) / 60000);
+  if (m < 60) return m + "m";
+  return Math.floor(m / 60) + "h " + (m % 60) + "m";
+}
+
 function analyticsTab(d) {
   const u = d.usage || {};
+  const a = d.analytics || {};
   const byModel = d.usage_by_model || {};
   const donutItems = Object.entries(byModel).filter(([m, v]) => m !== "unknown" && m !== "<synthetic>" && (v.total || 0) > 0)
     .map(([m, v], i) => ({ label: shortModel(m), value: v.total || 0, color: modelColor(m, i) }));
+  const costByModel = Object.entries(byModel).filter(([m, v]) => m !== "unknown" && m !== "<synthetic>" && (v.total || 0) > 0);
   const toolBars = Object.entries(d.tool_counts || {}).slice(0, 12)
     .map(([name, n]) => ({ label: name, value: n, valueText: String(n) }));
+  const fileBars = Object.entries(a.files_touched || {}).slice(0, 12)
+    .map(([f, n]) => ({ label: f.split("/").slice(-2).join("/"), value: n, valueText: String(n), color: "#6fb3ab" }));
+  const bashBars = Object.entries(a.bash_commands || {}).slice(0, 10)
+    .map(([c, n]) => ({ label: c, value: n, valueText: String(n), color: "#b98cc9" }));
+  const errBars = Object.entries(a.tool_errors || {})
+    .map(([name, n]) => ({ label: name, value: n, valueText: String(n), color: "#d8695a" }));
   const ctxPoints = (d.timeline || []).map((p, i) => ({ x: i, y: p.ctx }));
   const costPoints = (d.timeline || []).map((p, i) => ({ x: i, y: p.cost }));
+  const outPoints = (a.output_per_turn || []).map((v, i) => ({ x: i, y: v }));
+
+  const ctxTotal = (u.input || 0) + (u.cache_read || 0) + (u.cache_write || 0);
+  const cacheHit = ctxTotal ? (100 * (u.cache_read || 0) / ctxTotal) : 0;
+  const turns = a.assistant_turns || 1;
+  const thinkShare = (a.thinking_chars + a.text_chars) ? (100 * a.thinking_chars / (a.thinking_chars + a.text_chars)) : 0;
+  const errRate = a.tool_calls ? (100 * a.tool_error_total / a.tool_calls) : 0;
 
   return `<div class="tiles">
-      ${tile("Cost", fmt.cost(d.cost), null, true)}
-      ${tile("Total tokens", fmt.tokens(u.total))}
-      ${tile("Output tokens", fmt.tokens(u.output))}
-      ${tile("Cache read", fmt.tokens(u.cache_read))}
+      ${tile("Cost", fmt.cost(d.cost), "$" + (d.cost / turns).toFixed(3) + " / turn", true)}
+      ${tile("Total tokens", fmt.tokens(u.total), fmt.tokens(Math.round((u.output || 0) / turns)) + " out / turn")}
+      ${tile("Cache hit rate", cacheHit.toFixed(0) + "%", fmt.tokens(u.cache_read) + " read")}
+      ${tile("Duration", durationText(a.first_ts, a.last_ts), (a.user_prompts || 0) + " prompts · " + turns + " turns")}
+    </div>
+    <div class="tiles">
+      ${tile("Tool calls", fmt.num(a.tool_calls), Object.keys(d.tool_counts || {}).length + " distinct tools")}
+      ${tile("Tool errors", a.tool_error_total || 0, errRate.toFixed(1) + "% error rate")}
+      ${tile("Compactions", a.compactions || 0, "context resets")}
+      ${tile("Thinking share", thinkShare.toFixed(0) + "%", "of generated text")}
     </div>
     <div class="section"><div class="section-title">Token composition</div><div class="card">
       ${barChart([
@@ -486,22 +527,28 @@ function analyticsTab(d) {
         { label: "Cache write", value: u.cache_write || 0, valueText: fmt.tokens(u.cache_write), color: "#e0b64c" },
         { label: "Cache read", value: u.cache_read || 0, valueText: fmt.tokens(u.cache_read), color: "#7fae6f" },
       ])}</div></div>
-    ${donutItems.length ? `<div class="section"><div class="section-title">By model</div><div class="card">${donut(donutItems)}</div></div>` : ""}
-    <div class="section"><div class="section-title">Context window over time</div><div class="card">${sparkline(ctxPoints, "#7aa2c9")}</div></div>
+    ${donutItems.length ? `<div class="section"><div class="section-title">Tokens by model</div><div class="card">
+      <div style="display:flex;gap:28px;align-items:center;flex-wrap:wrap">${donut(donutItems)}
+      <div class="legend">${costByModel.map(([m, v], i) => `<div class="legend-item"><span class="legend-swatch" style="background:${modelColor(m, i)}"></span>${esc(shortModel(m))} <b style="color:var(--text)">${fmt.tokens(v.total)}</b> <span class="faint">(${fmt.tokens(v.output)} out)</span></div>`).join("")}</div></div></div></div>` : ""}
+    <div class="section"><div class="section-title">Context window over time · ${a.compactions || 0} compaction${(a.compactions || 0) === 1 ? "" : "s"}</div><div class="card">${sparkline(ctxPoints, "#7aa2c9")}</div></div>
     <div class="section"><div class="section-title">Cumulative cost</div><div class="card">${sparkline(costPoints, "#d97757")}</div></div>
-    ${toolBars.length ? `<div class="section"><div class="section-title">Tool usage</div><div class="card">${barChart(toolBars)}</div></div>` : ""}`;
+    ${outPoints.length > 1 ? `<div class="section"><div class="section-title">Output tokens per turn</div><div class="card">${sparkline(outPoints, "#7fae6f")}</div></div>` : ""}
+    <div class="section"><div class="section-title">Activity by hour (UTC)</div><div class="card">${columns(a.hourly_utc || [], "#e0b64c", Array.from({ length: 24 }, (_, i) => i))}</div></div>
+    ${toolBars.length ? `<div class="section"><div class="section-title">Tool usage</div><div class="card">${barChart(toolBars)}</div></div>` : ""}
+    ${fileBars.length ? `<div class="section"><div class="section-title">Hottest files</div><div class="card">${barChart(fileBars)}</div></div>` : ""}
+    ${bashBars.length ? `<div class="section"><div class="section-title">Top shell commands</div><div class="card">${barChart(bashBars)}</div></div>` : ""}
+    ${errBars.length ? `<div class="section"><div class="section-title">Errors by tool</div><div class="card">${barChart(errBars)}</div></div>` : ""}`;
 }
 
 function subagentsTab(d) {
-  const side = (d.events || []).filter((e) => e.sidechain);
-  const agentCalls = [];
-  (d.events || []).forEach((e) => (e.blocks || []).forEach((b) => {
-    if (b.type === "tool_use" && (b.name === "Agent" || b.name === "Task")) agentCalls.push(b);
-  }));
-  if (!side.length && !agentCalls.length) return emptyState("◊", "No subagent activity", "This session did not spawn subagents or Task/Agent tools.");
-  return `${agentCalls.length ? `<div class="section"><div class="section-title">Agent / Task invocations (${agentCalls.length})</div>
-      <div class="card">${agentCalls.map((b) => `<div class="block-tool"><span class="tool-name">⚒ ${esc(b.name)}</span><div class="tool-input">${esc(b.input_preview)}</div></div>`).join("")}</div></div>` : ""}
-    ${side.length ? `<div class="section"><div class="section-title">Sidechain messages (${side.length})</div>
+  // Server-aggregated: works regardless of which transcript window is loaded.
+  const sub = d.subagents || {};
+  const calls = sub.agent_calls || [];
+  const side = sub.events || [];
+  if (!side.length && !calls.length) return emptyState("◊", "No subagent activity", "This session did not spawn subagents or Agent/Task tools.");
+  return `${calls.length ? `<div class="section"><div class="section-title">Agent / Task invocations (${calls.length})</div>
+      <div class="card">${calls.map((c) => `<div class="block-tool"><span class="tool-name">⚒ ${esc(c.name)}</span><div class="tool-input">${esc(c.desc)}</div></div>`).join("")}</div></div>` : ""}
+    ${side.length ? `<div class="section"><div class="section-title">Sidechain messages (last ${side.length} of ${sub.count})</div>
       <div class="transcript">${side.map(renderMessage).join("")}</div></div>` : ""}`;
 }
 
@@ -758,17 +805,17 @@ async function selectProject(id, { keepSession = false } = {}) {
 }
 
 function detailSig(d) {
-  return ((d.events || []).length) + ":" + (((d.usage || {}).total) || 0) + ":" + ((d.scratchpad && d.scratchpad.files || []).length);
+  return (d.total_events || 0) + ":" + (((d.usage || {}).total) || 0) + ":" + ((d.scratchpad && d.scratchpad.files || []).length);
 }
 
 async function selectSession(sid) {
   State.sessionId = sid;
   State.view = "session";
-  State.tab = "transcript";
-  State.transcriptLimit = 250;
+  State.tab = "analytics"; // analytics-first
   document.getElementById("detail-pane").innerHTML = `<div class="detail-inner"><div class="skeleton">Loading session…</div></div>`;
   const d = await call("getSessionDetail", State.projectId, sid);
   State.detail = d || {};
+  State.transcript = { events: d && d.events || [], start: d && d.events_start || 0, total: d && d.total_events || 0 };
   State._detailSig = detailSig(State.detail);
   renderListPane(); renderDetail();
 }
@@ -841,8 +888,14 @@ document.addEventListener("click", async (ev) => {
     case "cfg-save": return void saveConfigFile(path);
     case "cfg-view": return void viewFileModal(path);
     case "show-earlier": {
-      State.transcriptLimit = (State.transcriptLimit || 250) + 500;
-      document.getElementById("tab-body").innerHTML = sessionTabBody();
+      const tr = State.transcript;
+      if (!tr || tr.start <= 0) break;
+      const page = await call("getTranscriptBefore", State.projectId, State.sessionId, tr.start, 200);
+      if (page && page.events) {
+        tr.events = page.events.concat(tr.events);
+        tr.start = page.start;
+        document.getElementById("tab-body").innerHTML = sessionTabBody();
+      }
       break;
     }
     case "copy-resume": {
@@ -1047,6 +1100,18 @@ function onDataChanged(reason) {
         if (d && detailSig(d) !== State._detailSig) {
           State._detailSig = detailSig(d);
           State.detail = d;
+          const tr = State.transcript;
+          if (tr && tr.events.length) {
+            // Append only the newly written events; keep any earlier pages loaded.
+            const lastIdx = tr.start + tr.events.length - 1;
+            const page = await call("getTranscriptAfter", State.projectId, State.sessionId, lastIdx);
+            if (page && page.events && page.events.length) {
+              tr.events = tr.events.concat(page.events);
+              tr.total = page.total;
+            }
+          } else {
+            State.transcript = { events: d.events || [], start: d.events_start || 0, total: d.total_events || 0 };
+          }
           renderDetail();
         }
       }
