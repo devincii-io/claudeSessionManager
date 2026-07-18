@@ -92,8 +92,8 @@ or `uv run python -m csm.app`.
 
 ```bash
 uv sync --extra build
-uv run pyinstaller --noconfirm --windowed --name "ClaudeSessionManager" \
-  --add-data "web:web" csm/app.py     # use "web;web" on Windows
+uv run pyinstaller --noconfirm --windowed --name ClaudeSessionManager \
+  --add-data "web:web" launcher.py    # use "web;web" on Windows
 ```
 
 The result lands in `dist/`. Runs on Linux and Windows.
