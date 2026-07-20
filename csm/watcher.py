@@ -1,4 +1,4 @@
-"""Filesystem watcher that turns Claude Code's on-disk changes into Qt signals.
+"""Filesystem watcher that turns local agent session changes into Qt signals.
 
 A single watchdog observer monitors the Claude home tree (projects, tasks,
 settings, image cache, statusline capture). A caller can additionally watch a
@@ -52,6 +52,12 @@ class Watcher(QObject):
             home = paths.claude_home()
             if home.is_dir():
                 self._observer.schedule(self._handler, str(home), recursive=True)
+            codex_sessions = paths.codex_sessions_dir()
+            if codex_sessions.is_dir():
+                # Watch only rollouts. Watching all of ~/.codex would include
+                # SQLite WAL, browser, plugin, and cache churn unrelated to the
+                # session workbench.
+                self._observer.schedule(self._handler, str(codex_sessions), recursive=True)
             self._observer.start()
         except Exception:
             pass

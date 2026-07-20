@@ -22,6 +22,47 @@ def claude_home() -> Path:
     return Path.home() / ".claude"
 
 
+def codex_home() -> Path:
+    """Return the Codex data directory (``~/.codex`` unless overridden).
+
+    Codex uses ``CODEX_HOME`` for alternate installations.  Keeping this
+    separate from :func:`claude_home` is important: the two products have
+    different session layouts and different configuration formats.
+    """
+    override = os.environ.get("CODEX_HOME")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".codex"
+
+
+def codex_sessions_dir() -> Path:
+    """Root of Codex's date-partitioned rollout transcript tree."""
+    return codex_home() / "sessions"
+
+
+def codex_session_index_file() -> Path:
+    """The optional newline-delimited mapping from thread ids to titles."""
+    return codex_home() / "session_index.jsonl"
+
+
+def codex_config_file() -> Path:
+    return codex_home() / "config.toml"
+
+
+def provider_home(provider: str) -> Path:
+    """Resolve a supported provider home without silently guessing.
+
+    Mutating callers should always pass an explicit provider.  Raising for an
+    unknown value prevents a typo from accidentally routing a write into the
+    Claude home.
+    """
+    if provider == "claude":
+        return claude_home()
+    if provider == "codex":
+        return codex_home()
+    raise ValueError(f"unsupported provider: {provider}")
+
+
 def projects_dir() -> Path:
     return claude_home() / "projects"
 

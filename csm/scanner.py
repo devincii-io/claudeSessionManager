@@ -29,8 +29,9 @@ from .session_parser import (
 )
 
 ACTIVE_WINDOW_SECONDS = 120  # a session whose jsonl changed this recently is "live"
+PROTECTED_WINDOW_SECONDS = 600  # conservative deletion guard for quiet tool/model runs
 CACHE_VERSION = 2  # bump when SessionSummary's schema or computation changes
-MAX_DETAIL_STATES = 4  # incremental transcript states kept in memory
+MAX_DETAIL_STATES = 2  # incremental transcript states kept in memory
 
 
 class Scanner:
@@ -42,6 +43,8 @@ class Scanner:
         self._sum_states: dict[str, dict] = {}
         # path -> {"builder": DetailBuilder, "offset": int, "used": float}
         self._detail_states: dict[str, dict] = {}
+        self._history_records: list[dict] = []
+        self._history_offset = 0
         self._load_cache()
 
     # -- summary cache ------------------------------------------------------ #
@@ -141,6 +144,7 @@ class Scanner:
         for f in pdir.glob("*.jsonl"):
             s = self._summary(f).to_dict()
             s["active"] = now - s["mtime"] <= ACTIVE_WINDOW_SECONDS
+            s["protected"] = now - s["mtime"] <= PROTECTED_WINDOW_SECONDS
             out.append(s)
         self._save_cache()
         out.sort(key=lambda s: s["mtime"], reverse=True)
@@ -180,6 +184,7 @@ class Scanner:
                         "mtime": s.mtime,
                         "created": s.created,
                         "active": now - s.mtime <= ACTIVE_WINDOW_SECONDS,
+                        "protected": now - s.mtime <= PROTECTED_WINDOW_SECONDS,
                         "has_subagents": s.has_subagents,
                         "models": [m for m in s.models if m != "<synthetic>"],
                     })
@@ -223,6 +228,11 @@ class Scanner:
             if s.cwd:
                 return s.cwd
         return ""
+
+    def release_detail(self, project_id: str, session_id: str) -> None:
+        """Release a reconstructed transcript when its inspector is closed."""
+        key = str(paths.projects_dir() / project_id / f"{session_id}.jsonl")
+        self._detail_states.pop(key, None)
 
     # -- session detail (incremental, paged) --------------------------------- #
 
@@ -505,34 +515,49 @@ class Scanner:
                 )
         sessions.sort(key=lambda x: x["mtime"], reverse=True)
 
+        self._refresh_history_index()
         prompts = []
+        for rec in reversed(self._history_records):
+            display = rec.get("display", "")
+            if q not in display.lower():
+                continue
+            project = rec.get("project", "")
+            prompts.append(
+                {
+                    "display": display[:220],
+                    "project": project,
+                    "project_name": Path(project).name if project else "",
+                    "project_id": paths.encode_project_path(project) if project else "",
+                    "session_id": rec.get("sessionId", ""),
+                    "timestamp": rec.get("timestamp", 0),
+                }
+            )
+            if len(prompts) >= 50:
+                break
+        return {"sessions": sessions[:50], "prompts": prompts}
+
+    def _refresh_history_index(self) -> None:
+        """Incrementally cache prompt history instead of rereading it per query."""
         hist = paths.claude_home() / "history.jsonl"
-        if hist.is_file():
+        try:
+            size = hist.stat().st_size
+        except OSError:
+            self._history_records = []
+            self._history_offset = 0
+            return
+        if size < self._history_offset:
+            self._history_records = []
+            self._history_offset = 0
+        lines, self._history_offset = read_new_lines(hist, self._history_offset)
+        for line in lines:
+            if not line:
+                continue
             try:
-                for line in hist.read_text("utf-8", errors="replace").splitlines():
-                    if not line.strip():
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    display = rec.get("display", "")
-                    if q in display.lower():
-                        project = rec.get("project", "")
-                        prompts.append(
-                            {
-                                "display": display[:220],
-                                "project": project,
-                                "project_name": Path(project).name if project else "",
-                                "project_id": paths.encode_project_path(project) if project else "",
-                                "session_id": rec.get("sessionId", ""),
-                                "timestamp": rec.get("timestamp", 0),
-                            }
-                        )
-            except OSError:
-                pass
-        prompts.reverse()  # newest first
-        return {"sessions": sessions[:50], "prompts": prompts[:50]}
+                rec = _loads(line)
+            except Exception:
+                continue
+            if isinstance(rec, dict) and rec.get("display"):
+                self._history_records.append(rec)
 
     # -- settings & statusline --------------------------------------------- #
 

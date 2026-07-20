@@ -8,13 +8,39 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
+import time
+from urllib.parse import quote
 from pathlib import Path
 
 from . import paths
 
 _STATUSLINE_MARKER = "# >>> claude-session-manager capture >>>"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write UTF-8 text via same-directory replace to avoid partial configs."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(content, "utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _backup_existing(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.csm-backup-{stamp}")
+    shutil.copy2(path, backup)
+    return str(backup)
 
 
 def _under(path: Path, root: Path) -> bool:
@@ -40,6 +66,11 @@ def delete_session(project_id: str, session_id: str, purge: bool = False) -> dic
     removed: list[str] = []
 
     jsonl = pdir / f"{session_id}.jsonl"
+    try:
+        if jsonl.is_file() and time.time() - jsonl.stat().st_mtime <= 600:
+            return {"ok": False, "error": "Session had activity in the last 10 minutes; deletion is temporarily blocked"}
+    except OSError:
+        pass
     if jsonl.is_file() and _under(jsonl, home):
         jsonl.unlink()
         removed.append(str(jsonl))
@@ -145,6 +176,178 @@ def open_path(path: str) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def _cli_binary(provider: str) -> str | None:
+    """Resolve a CLI, honoring an explicit Codex path before PATH.
+
+    Microsoft Store aliases can be discoverable yet inaccessible to ordinary
+    desktop processes.  Codex candidates are therefore probed once per action;
+    the documented ``CODEX_CLI_PATH`` escape hatch supports custom installs.
+    """
+    command = "claude" if provider == "claude" else "codex"
+    candidates = []
+    if provider == "codex" and os.environ.get("CODEX_CLI_PATH"):
+        candidates.append(os.environ["CODEX_CLI_PATH"])
+    found = shutil.which(command)
+    if found:
+        candidates.append(found)
+    for candidate in candidates:
+        if provider == "claude":
+            return candidate
+        try:
+            probe = subprocess.run([candidate, "--version"], capture_output=True, timeout=5, check=False)
+            if probe.returncode == 0:
+                return candidate
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
+def launch_session(provider: str, project_path: str, session_id: str = "", mode: str = "resume") -> dict:
+    """Open Claude Code or Codex in a real terminal.
+
+    ``mode`` is currently ``resume`` or ``fork``.  A blank session id always
+    starts a new session.  Keeping terminal launch here (instead of in the web
+    UI) gives every platform the same validation and quoting rules.
+    """
+    if provider not in {"claude", "codex"}:
+        return {"ok": False, "error": "Unknown agent"}
+    cwd = Path(project_path).expanduser()
+    if not cwd.is_dir():
+        return {"ok": False, "error": "Project folder no longer exists"}
+    if session_id and not all(ch.isalnum() or ch in "-_" for ch in session_id):
+        return {"ok": False, "error": "Invalid session id"}
+
+    command = "claude" if provider == "claude" else "codex"
+    binary = _cli_binary(provider)
+    if not binary:
+        # The Windows Codex desktop app documents deep links for new and
+        # existing local chats.  They keep quick launch useful even when the
+        # Store CLI alias is inaccessible to an unpackaged process.
+        if provider == "codex" and platform.system() == "Windows" and mode != "fork":
+            uri = f"codex://threads/{session_id}" if session_id else f"codex://new?path={quote(str(cwd))}"
+            try:
+                os.startfile(uri)  # type: ignore[attr-defined]
+                return {"ok": True, "provider": "codex", "mode": "resume" if session_id else "new", "target": "desktop"}
+            except OSError as exc:
+                return {"ok": False, "error": f"Codex CLI unavailable and desktop deep link failed: {exc}"}
+        suffix = "; set CODEX_CLI_PATH to a runnable binary" if provider == "codex" else ""
+        return {"ok": False, "error": f"The '{command}' CLI was not found or runnable{suffix}"}
+    if provider == "claude":
+        if mode == "fork":
+            return {"ok": False, "error": "Fork is only available for Codex sessions"}
+        args = ["--resume", session_id] if session_id else []
+    else:
+        subcommand = "fork" if mode == "fork" else "resume"
+        args = [subcommand, session_id] if session_id else []
+
+    try:
+        system = platform.system()
+        if system == "Windows":
+            # Claude is commonly a .cmd shim. cmd.exe supports that while the
+            # new console keeps the interactive process independent of the app.
+            subprocess.Popen(
+                ["cmd.exe", "/k", binary, *args],
+                cwd=str(cwd),
+                creationflags=subprocess.CREATE_NEW_CONSOLE,  # type: ignore[attr-defined]
+            )
+            return {"ok": True, "provider": provider, "mode": mode if session_id else "new"}
+
+        if system == "Darwin":
+            command = f"cd {shlex.quote(str(cwd))} && exec {shlex.join([binary, *args])}"
+            script = f'tell application "Terminal" to do script {json.dumps(command)}'
+            subprocess.Popen(["osascript", "-e", script])
+            return {"ok": True, "provider": provider, "mode": mode if session_id else "new"}
+
+        terminal_specs = (
+            ("gnome-terminal", ["--working-directory", str(cwd), "--", binary, *args]),
+            ("konsole", ["--workdir", str(cwd), "-e", binary, *args]),
+            ("xfce4-terminal", ["--working-directory", str(cwd), "-x", binary, *args]),
+            ("x-terminal-emulator", ["-e", binary, *args]),
+        )
+        for terminal, terminal_args in terminal_specs:
+            found = shutil.which(terminal)
+            if found:
+                subprocess.Popen([found, *terminal_args], cwd=str(cwd))
+                return {"ok": True, "provider": provider, "mode": mode if session_id else "new"}
+        return {"ok": False, "error": "No supported terminal emulator was found"}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def launch_claude(project_path: str, session_id: str = "") -> dict:
+    """Backward-compatible Claude launcher used by older callers/tests."""
+    return launch_session("claude", project_path, session_id)
+
+
+def archive_codex_session(session_id: str) -> dict:
+    """Ask the Codex CLI to archive a session without mutating its indexes.
+
+    The CLI owns the archive format and any database bookkeeping.  This is the
+    normal Codex cleanup action; raw JSONL deletion is deliberately not used.
+    """
+    if not session_id or not all(ch.isalnum() or ch in "-_" for ch in session_id):
+        return {"ok": False, "error": "Invalid session id"}
+    binary = _cli_binary("codex")
+    if not binary:
+        return {"ok": False, "error": "The 'codex' CLI was not found or runnable; set CODEX_CLI_PATH"}
+    try:
+        result = subprocess.run(
+            [binary, "archive", session_id],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": str(exc)}
+    if result.returncode:
+        message = (result.stderr or result.stdout or "Codex could not archive the session").strip()
+        return {"ok": False, "error": message[-1000:]}
+    return {"ok": True, "session_id": session_id, "archived": True}
+
+
+def list_codex_config_files(project_path: str = "") -> list[dict]:
+    """Return only safe, user-editable Codex instruction/config files."""
+    candidates: list[tuple[Path, str]] = [
+        (paths.codex_home() / "config.toml", "Codex home"),
+        (paths.codex_home() / "AGENTS.md", "Codex home"),
+    ]
+    base = Path(project_path).expanduser() if project_path else None
+    if base and base.is_dir():
+        candidates.append((base / "AGENTS.md", "Project"))
+    out: list[dict] = []
+    for path, group in candidates:
+        try:
+            st = path.stat()
+            out.append({"path": str(path), "name": path.name, "group": group, "size": st.st_size, "mtime": st.st_mtime})
+        except OSError:
+            out.append({"path": str(path), "name": path.name, "group": group, "size": 0, "mtime": 0, "missing": True})
+    return out
+
+
+def write_codex_file(path: str, content: str, project_path: str = "") -> dict:
+    """Atomically write config.toml or AGENTS.md at an allowed Codex scope."""
+    target = Path(path).expanduser()
+    allowed = {paths.codex_home() / "config.toml", paths.codex_home() / "AGENTS.md"}
+    base = Path(project_path).expanduser() if project_path else None
+    if base and base.is_dir():
+        allowed.add(base / "AGENTS.md")
+    try:
+        resolved = target.resolve()
+        allowed_resolved = {p.resolve() for p in allowed}
+    except OSError:
+        return {"ok": False, "error": "Invalid path"}
+    if resolved not in allowed_resolved:
+        return {"ok": False, "error": "Refused: not an editable Codex config file"}
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        backup = _backup_existing(resolved)
+        _atomic_write_text(resolved, content)
+        return {"ok": True, "path": str(resolved), "backup": backup}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def _settings_set(data: dict, key: str, value) -> None:
     """Apply one dotted ``key`` = ``value`` to ``data`` in place. ``value`` of
     ``None`` deletes the key and prunes any parent objects it leaves empty, so
@@ -185,7 +388,7 @@ def _write_settings(data: dict) -> dict:
     f = paths.claude_home() / "settings.json"
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
+        _atomic_write_text(f, json.dumps(data, indent=2) + "\n")
         return {"ok": True}
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
@@ -295,8 +498,9 @@ def write_guidance(scope: str, content: str, project_path: str = "") -> dict:
         return {"ok": False, "error": "no target"}
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, "utf-8")
-        return {"ok": True, "path": str(p)}
+        backup = _backup_existing(p)
+        _atomic_write_text(p, content)
+        return {"ok": True, "path": str(p), "backup": backup}
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -309,6 +513,7 @@ def write_memory_notes(project_id: str, notes: list) -> dict:
         return {"ok": False, "error": "refused"}
     mem_dir.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
+    backups: list[str] = []
     index_lines: list[str] = []
     for n in notes or []:
         name = str(n.get("name") or "").strip()
@@ -326,7 +531,10 @@ def write_memory_notes(project_id: str, notes: list) -> dict:
             "---\n\n"
         )
         try:
-            f.write_text(front + body + "\n", "utf-8")
+            backup = _backup_existing(f)
+            if backup:
+                backups.append(backup)
+            _atomic_write_text(f, front + body + "\n")
             written.append(str(f))
             index_lines.append(f"- [{name.removesuffix('.md')}]({fname}) — {n.get('description', '')}")
         except OSError:
@@ -338,10 +546,15 @@ def write_memory_notes(project_id: str, notes: list) -> dict:
             existing = idx.read_text("utf-8", errors="replace") if idx.is_file() else "# Memory Index\n"
             if not existing.endswith("\n"):
                 existing += "\n"
-            idx.write_text(existing + "\n".join(index_lines) + "\n", "utf-8")
+            additions = [line for line in index_lines if line.split(")", 1)[0] + ")" not in existing]
+            if additions:
+                backup = _backup_existing(idx)
+                if backup:
+                    backups.append(backup)
+                _atomic_write_text(idx, existing + "\n".join(additions) + "\n")
         except OSError:
             pass
-    return {"ok": bool(written), "written": written, "count": len(written)}
+    return {"ok": bool(written), "written": written, "count": len(written), "backups": backups}
 
 
 def read_text_file(path: str, limit: int = 400_000) -> dict:

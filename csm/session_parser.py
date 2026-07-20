@@ -44,31 +44,36 @@ PREVIEW_TRUNCATE = 600
 
 
 def read_new_lines(path: Path, offset: int) -> tuple[list[bytes], int]:
-    """Read complete lines appended after ``offset``; return (lines, new_offset)."""
+    """Read complete lines appended after ``offset`` without a second full blob."""
+    lines: list[bytes] = []
+    new_offset = offset
     try:
         with path.open("rb") as fh:
             fh.seek(offset)
-            data = fh.read()
+            while True:
+                line = fh.readline()
+                if not line or not line.endswith(b"\n"):
+                    break
+                lines.append(line[:-1])
+                new_offset = fh.tell()
     except OSError:
         return [], offset
-    if not data:
-        return [], offset
-    end = data.rfind(b"\n")
-    if end == -1:
-        return [], offset
-    return data[:end].split(b"\n"), offset + end + 1
+    return lines, new_offset
 
 
 def iter_file_records(path: Path):
     """One full pass over a jsonl file (used where incremental state is absent)."""
-    lines, _ = read_new_lines(path, 0)
-    for line in lines:
-        if not line:
-            continue
-        try:
-            yield _loads(line)
-        except Exception:
-            continue
+    try:
+        with path.open("rb") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    yield _loads(line)
+                except Exception:
+                    continue
+    except OSError:
+        return
 
 
 # --------------------------------------------------------------------------- #

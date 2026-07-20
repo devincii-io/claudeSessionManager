@@ -53,7 +53,7 @@ from .bridge import Bridge
 from .scanner import Scanner
 from .watcher import Watcher
 
-APP_NAME = "Claude Session Manager"
+APP_NAME = "Agent Session Manager"
 
 
 def _close_splash() -> None:

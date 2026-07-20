@@ -1,49 +1,54 @@
-<p align="center"><img src="web/icons/app-128.png" alt="Claude Session Manager" width="96"></p>
+<p align="center"><img src="web/icons/app-128.png" alt="Agent Session Manager" width="96"></p>
 
-# Claude Session Manager
+# Agent Session Manager
 
-> **Unofficial community tool** — not affiliated with, or endorsed by, Anthropic.
-> "Claude" is a trademark of Anthropic, PBC. This app only reads files that
-> Claude Code stores on your own machine.
+> **Unofficial community tool** — not affiliated with or endorsed by Anthropic
+> or OpenAI. Claude is a trademark of Anthropic, PBC. Codex and OpenAI are
+> trademarks of OpenAI. The app indexes local agent session data.
 
-A modern, fast desktop app for exploring everything **Claude Code** stores on your
-machine — sessions, memory, subagents, scratchpads, tasks, images, shells,
-settings and live state — all grouped by project and richly visualized. Built
-with **PySide6** + **QtWebEngine** (an HTML/CSS/JS frontend for a beautiful,
-extensible UI) and managed with **uv**. Cross-platform: Linux and Windows.
+A fast desktop workbench for local **Claude Code and Codex** sessions. Switch
+between `All`, `Claude`, and `Codex`; browse projects and transcripts; inspect
+tokens, context pressure, tools, compactions, and subagents; launch or resume
+work; search history; manage storage; and edit each agent's configuration without
+pretending their formats or capabilities are identical. Built with **PySide6** +
+**QtWebEngine** and managed with **uv**. Cross-platform: Windows and Linux.
 
-![Session analytics](docs/screenshot.png)
-
-| Overview | Transcript |
-|---|---|
-| ![Overview](docs/overview.png) | ![Transcript](docs/transcript.png) |
-| **Cleanup** | **Privacy-first settings** |
-| ![Cleanup](docs/cleanup.png) | ![Settings](docs/settings.png) |
+![Agent Session Manager workbench](docs/screenshot.png)
 
 *(Screenshots show generated demo data.)*
 
-**Fast by design:** `orjson` parsing (a cold 10 MB transcript summarizes in
+**Fast by design:** streaming `orjson` parsing (a cold 10 MB Claude transcript summarizes in
 ~40 ms), disk-cached summaries keyed by mtime+size, and *incremental* parsing —
 while a session is live, only the newly appended bytes are read (~0.1 ms per
 refresh), never the whole file. Transcripts are **paged**: the backend serves a
 small window of messages and loads earlier pages on demand, so even a 100 MB
-session opens instantly on every tab; live sessions append only newly written
-events. Statusline ticks are routed on a cheap path that never triggers a
-rescan.
+session opens with a small tail window and earlier messages load on demand. Live
+tail-following keeps a bounded browser window, and path-aware filesystem events
+refresh only the affected view instead of repeatedly rebuilding global analytics.
+Codex rollouts are grouped by canonical working directory, parsed lazily, and
+use cumulative token snapshots correctly; subagent rollouts do not inflate the
+top-level session count.
+
+**Fast to drive:** `Ctrl+Shift+P` opens every command, `Ctrl+P` quick-opens a
+project/session, `Ctrl+F` filters, `Ctrl+Shift+F` searches all prompt history,
+`Ctrl+N` starts the selected agent in the current project, and `Ctrl+Enter` resumes the
+selected session. Press `?` inside the app for the complete shortcut reference.
 
 Docs: [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 [LICENSE](LICENSE) · [vendor/NOTICE](vendor/NOTICE)
 
 ## What it shows
 
-- **Projects** — every project Claude Code has touched, ranked by spend, with live
-  activity indicators.
+- **Agent switcher** — `All | Claude | Codex` is a visible session-source filter,
+  not a claim that an existing conversation can be converted between agents.
+- **Projects** — every local project either agent has touched, ranked by recent
+  activity with explicit agent badges.
 - **Sessions** — per-session transcript viewer (user / assistant / thinking / tool
   calls / results), reconstructed from the `.jsonl` transcripts.
-- **Analytics** — cost, token composition (input / output / cache read / write),
-  spend by model, context-window-over-time and cumulative-cost sparklines, and
-  tool-usage breakdowns. Cost is computed from real usage with a built-in,
-  editable model price table; assistant usage is de-duplicated by `message.id`.
+- **Analytics** — token composition, context pressure, compactions,
+  reasoning/output, tool errors, files, commands, and model share. Claude can
+  show an explicitly labelled API-price estimate. Codex ChatGPT-plan usage is
+  never misrepresented as dollar spend.
 - **Context meters** — the statusline-style 10-slot meter, reconstructed per
   session from token usage (`input + cache_read + cache_write` ÷ context window).
 - **Subagents** — sidechain messages and `Agent`/`Task` invocations.
@@ -51,21 +56,25 @@ Docs: [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
   files with frontmatter), with in-app **edit / save / delete**.
 - **Scratchpads** — the per-session scratchpad tree, with previews.
 - **Tasks** — the per-session task board.
-- **Cleanup** — reclaim disk space: every session on the machine with its full
+- **Cleanup** — manage every session on the machine with its full
   on-disk footprint, multi-selected by hand or with one-tap presets (empty, small
   talk, under 1¢, older than 30 days, largest 10) and deleted in bulk. Live
-  sessions are protected.
-- **Tune** — drive your own signed-in `claude` CLI over your history to **refine
+  sessions active in the last 10 minutes are conservatively protected and the
+  backend rechecks immediately before deletion. Claude transcripts can be
+  deleted; Codex sessions are archived through the supported Codex CLI command.
+- **Instructions** — drive your own signed-in `claude` CLI over your history to **refine
   a CLAUDE.md** (global or per-project) or **consolidate sessions into memory
-  notes**. Runs headless and async; only session summaries are sent, never full
-  transcripts.
-- **Settings** — a comprehensive, catalog-driven editor: a **Privacy & data**
+  notes**. Runs headless, async, cancellable, and backed up before writing; only
+  session summaries are sent, never full transcripts. Codex exposes safe
+  `config.toml` and global/project `AGENTS.md` editing with backups; the app does
+  not auto-synchronize AGENTS.md and CLAUDE.md.
+- **Claude settings** — a comprehensive, catalog-driven editor: a **Privacy & data**
   section with one-tap privacy-first defaults (keep sessions off claude.ai, kill
   non-essential traffic, disable telemetry / error reporting), a dedicated
   **environment-variable** editor, and arbitrary custom keys — all writing
   straight to `settings.json`. Only settings you actually set are written;
   removing one prunes it, so the file never accumulates dead keys.
-- **Live monitor** — active sessions and context pressure, updated live via a
+- **Live monitor** — recently active sessions and context pressure, updated via a
   filesystem watcher.
 - **Live statusline capture** (opt-in) — rate limits (5h / 7d) and live context %
   are only handed to your statusline command by Claude Code and aren't stored on
@@ -78,22 +87,23 @@ Docs: [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 - **Settings as controls** — toggles and dropdowns writing straight to
   `settings.json`, plus an in-app editor for small config files
   (`statusline-command.sh`, `settings.json`, commands, agents…).
-- **Copy resume** — one click copies `claude --resume <session-id>`.
+- **Quick launch** — start/resume Claude or Codex with the exact provider-aware
+  command. On Windows, documented `codex://` desktop deep links are used when the
+  Store CLI alias is unavailable; set `CODEX_CLI_PATH` for terminal launch.
 
 Buttons throughout open paths in **VS Code** or your file manager, and sessions /
 memory can be **deleted** (with confirmation).
 
 ## Where the data lives
 
-| What | Path |
-|---|---|
-| Config home | `~/.claude` (or `%USERPROFILE%\.claude`, or `$CLAUDE_CONFIG_DIR`) |
-| Sessions | `~/.claude/projects/<encoded-path>/<session>.jsonl` |
-| Memory | `~/.claude/projects/<encoded-path>/memory/` |
-| Tasks | `~/.claude/tasks/<session>/*.json` |
-| Scratchpads | `<tmp>/claude-<uid>/<encoded-path>/<session>/scratchpad/` |
-| Settings | `~/.claude/settings.json`, `settings.local.json` |
-| Statusline | `~/.claude/statusline-command.sh` |
+| Agent | What | Path |
+|---|---|---|
+| Claude | Config home | `~/.claude` or `$CLAUDE_CONFIG_DIR` |
+| Claude | Sessions | `~/.claude/projects/<encoded-path>/<session>.jsonl` |
+| Claude | Memory / tasks | `~/.claude/projects/.../memory/`, `~/.claude/tasks/...` |
+| Codex | Data home | `~/.codex` or `$CODEX_HOME` |
+| Codex | Sessions | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` |
+| Codex | Settings / instructions | `$CODEX_HOME/config.toml`, `AGENTS.md` |
 
 ## Run
 
@@ -121,9 +131,11 @@ cross-compile, so run the build on the OS you're targeting (on Windows via
 
 ```
 csm/
-  paths.py            cross-platform Claude path resolution
+  paths.py            cross-platform Claude and Codex path resolution
   pricing.py          model price table + cost math
   session_parser.py   streaming .jsonl parser (summary + detail)
+  codex_session_parser.py  tolerant Codex rollout adapter
+  codex_scanner.py    Codex project/session index and locator map
   scanner.py          enumerate projects/sessions/memory/tasks/scratchpad/settings (cached)
   watcher.py          watchdog → Qt signals (live updates)
   actions.py          delete / bulk-delete / save / settings / statusline hook
@@ -134,5 +146,7 @@ web/
   index.html styles.css app.js   the frontend
 ```
 
-Nothing is sent anywhere — the app only reads and (on explicit action) writes your
-local Claude directory.
+Browsing and analytics stay local. Writes occur only after an explicit action and
+are path-guarded; instruction/config overwrites create backups. Claude instruction
+optimization intentionally invokes your signed-in local CLI with selected summaries,
+which may contact that agent's service. Full transcripts are not sent by the app.

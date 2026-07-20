@@ -1,7 +1,7 @@
 [project]
 name = "claude-session-manager"
-version = "1.0.0"
-description = "A modern desktop visualizer for Claude Code sessions, memory, subagents, scratchpads, settings and live state."
+version = "1.1.0"
+description = "A fast local desktop workbench for Claude Code and Codex sessions."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Devin" }]

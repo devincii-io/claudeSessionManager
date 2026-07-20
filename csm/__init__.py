@@ -1,3 +1,3 @@
-"""Claude Session Manager — a desktop visualizer for Claude Code's on-disk state."""
+"""Agent Session Manager — a local Claude Code and Codex workbench."""
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"

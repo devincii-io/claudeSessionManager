@@ -3,62 +3,102 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Claude Session Manager</title>
+  <title>Agent Session Manager</title>
   <link rel="icon" type="image/svg+xml" href="icons/logo.svg" />
   <link rel="stylesheet" href="styles.css" />
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 </head>
 <body>
   <div id="app">
-    <!-- Top bar -->
-    <header class="topbar">
+    <header class="topbar" role="banner">
       <div class="brand">
-        <img class="brand-mark" src="icons/app-64.png" alt="" />
-        <span class="brand-name">Claude<span class="brand-thin"> Session Manager</span></span>
+        <span class="brand-mark" aria-hidden="true">ASM</span>
+        <span class="brand-name">Session Manager</span>
+      </div>
+      <div id="agent-switch" class="agent-switch" role="group" aria-label="Session source">
+        <button type="button" data-agent="all">All</button>
+        <button type="button" data-agent="claude">Claude</button>
+        <button type="button" data-agent="codex">Codex</button>
       </div>
       <div class="search-wrap">
-        <input id="search" type="text" placeholder="Filter… (Enter = search all sessions & prompt history)" autocomplete="off" spellcheck="false" />
+        <span class="search-icon" aria-hidden="true">/</span>
+        <input id="search" type="text" placeholder="Filter projects and sessions" aria-label="Filter projects and sessions" autocomplete="off" spellcheck="false" />
+        <kbd class="input-hint">Ctrl F</kbd>
       </div>
+      <button id="command-trigger" class="command-trigger" type="button" title="Open command launcher (Ctrl+K)">
+        <span>Commands</span><kbd>Ctrl K</kbd>
+      </button>
+      <button id="help-trigger" class="icon-btn" type="button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
       <div class="topbar-right">
-        <div id="live-dot" class="live-dot" title="Watching ~/.claude for changes — turns amber whenever Claude Code writes to disk">
-          <span class="pulse"></span> <span id="live-label">watching</span>
+        <div id="live-dot" class="live-dot" title="Watching local agent session data for changes">
+          <span class="pulse"></span> <span id="live-label">live</span>
         </div>
-        <button id="refresh-btn" class="icon-btn" title="Refresh">⟳</button>
-        <button id="win-min" class="icon-btn" title="Minimize window">–</button>
-        <button id="win-close" class="icon-btn win-close" title="Close window">✕</button>
+        <button id="refresh-btn" class="icon-btn" type="button" title="Refresh data (F5)" aria-label="Refresh">&#8635;</button>
+        <span class="window-divider" aria-hidden="true"></span>
+        <button id="win-min" class="icon-btn window-btn" type="button" title="Minimize window" aria-label="Minimize">&#8722;</button>
+        <button id="win-close" class="icon-btn window-btn win-close" type="button" title="Close window" aria-label="Close">&#215;</button>
       </div>
     </header>
 
     <div class="body">
-      <!-- Rail: nav + projects -->
-      <nav class="rail">
+      <nav class="rail" aria-label="Primary navigation">
         <div class="nav-group">
-          <button class="nav-item active" data-view="overview">
-            <span class="nav-ic">◈</span> Overview
+          <button class="nav-item active" data-view="overview" title="Overview (Ctrl+1)">
+            <span class="nav-ic">01</span><span>Overview</span><kbd>Ctrl 1</kbd>
           </button>
-          <button class="nav-item" data-view="settings">
-            <span class="nav-ic">⚙</span> Settings
+          <button class="nav-item" data-view="monitor" title="Monitor (Ctrl+2)">
+            <span class="nav-ic">02</span><span>Monitor</span><kbd>Ctrl 2</kbd>
           </button>
-          <button class="nav-item" data-view="monitor">
-            <span class="nav-ic">◉</span> Monitor
+          <button class="nav-item" data-view="cleanup" title="Cleanup (Ctrl+3)">
+            <span class="nav-ic">03</span><span>Cleanup</span><kbd>Ctrl 3</kbd>
           </button>
-          <button class="nav-item" data-view="cleanup">
-            <span class="nav-ic">🧹</span> Cleanup
+          <button class="nav-item" data-view="tune" title="Agent instructions and memory (Ctrl+4)">
+            <span class="nav-ic">04</span><span>Instructions</span><kbd>Ctrl 4</kbd>
           </button>
-          <button class="nav-item" data-view="tune">
-            <span class="nav-ic">✦</span> Tune
+          <button class="nav-item" data-view="settings" title="Settings (Ctrl+,)">
+            <span class="nav-ic">&#9881;</span><span>Settings</span><kbd>Ctrl ,</kbd>
           </button>
         </div>
-        <div class="rail-label">Projects</div>
+        <div class="rail-section-head"><span>Projects</span><span id="project-count" class="count"></span></div>
         <div id="project-list" class="project-list"></div>
+        <div class="rail-footer">
+          <button class="rail-command" data-action="launch-new" title="Start the selected agent in the current project (Ctrl+N)">
+            <span>+ New session</span><kbd>Ctrl N</kbd>
+          </button>
+        </div>
       </nav>
 
-      <!-- Middle list pane -->
-      <section id="list-pane" class="list-pane"></section>
-
-      <!-- Main detail pane -->
+      <section id="list-pane" class="list-pane" aria-label="Sessions"></section>
       <main id="detail-pane" class="detail-pane"></main>
     </div>
+
+    <footer class="statusbar" aria-label="Application status">
+      <span id="status-scope">All projects</span>
+      <span id="status-summary">Loading session index...</span>
+      <span class="status-spacer"></span>
+      <button data-action="show-shortcuts">Keyboard shortcuts</button>
+      <span>v1.1.0</span>
+    </footer>
+  </div>
+
+  <div id="command-backdrop" class="palette-backdrop" hidden>
+    <section class="palette" role="dialog" aria-modal="true" aria-labelledby="palette-title">
+      <div class="palette-input-row">
+        <span class="prompt-mark" aria-hidden="true">&gt;</span>
+        <input id="command-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type a command, project, or session..." aria-label="Command launcher" />
+        <kbd>Esc</kbd>
+      </div>
+      <div class="palette-meta"><span id="palette-title">Command launcher</span><span>Enter to run · ↑↓ to navigate</span></div>
+      <div id="command-results" class="command-results" role="listbox"></div>
+    </section>
+  </div>
+
+  <div id="shortcut-backdrop" class="palette-backdrop" hidden>
+    <section class="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-title">
+      <div class="dialog-head"><div><div class="eyebrow">REFERENCE</div><h2 id="shortcut-title">Keyboard shortcuts</h2></div><button class="icon-btn" data-action="close-shortcuts" aria-label="Close">&#215;</button></div>
+      <div id="shortcut-grid" class="shortcut-grid"></div>
+      <div class="dialog-foot">Shortcuts pause while you are editing text. Press <kbd>Esc</kbd> to close dialogs.</div>
+    </section>
   </div>
   <script src="app.js"></script>
 </body>

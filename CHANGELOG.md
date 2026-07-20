@@ -4,6 +4,70 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-07-21
+
+### Added
+- **First-class Codex support** alongside Claude Code, with a persistent
+  `All | Claude | Codex` switcher, provider badges, unified project/session
+  browsing, global search, transcripts, analytics, and provider-aware commands.
+- A version-tolerant Codex rollout adapter that uses canonical metadata IDs,
+  groups sessions by working directory, excludes subagent rollouts from root
+  counts, de-duplicates message channels, and treats token snapshots as
+  cumulative rather than additive.
+- Codex quick launch/resume (including documented Windows desktop deep-link
+  fallback), fork, supported CLI archive cleanup, and safe `config.toml` /
+  `AGENTS.md` editing. Credentials, SQLite state, encrypted reasoning, and
+  sandbox secrets are intentionally never exposed.
+- **Universal command launcher** (`Ctrl+Shift+P`, `Ctrl+K`, or `F1`) for views,
+  projects, current-session navigation, refresh, new sessions, resume, and help.
+  `Ctrl+P` opens the project/session quick-open scope.
+- **Quick launch** actions on Overview and project/session pages: start Claude in
+  a project or resume a selected session directly in a new terminal.
+- A complete, discoverable keyboard model with contextual shortcuts, pane
+  cycling, tab cycling, filter/global search, rail toggle, and a searchable
+  shortcut reference.
+- **Context status** guidance using context pressure, compactions, and tool error
+  rate, with focused `/compact` and start-fresh actions. Wall-clock duration alone
+  is deliberately not treated as unhealthy.
+- Fourteen regression tests covering both providers, deletion safety, atomic
+  backups, path guards, launcher routing, identity, cumulative usage,
+  root/subagent grouping, and incremental JSONL reading.
+- A static browser preview with generated data for fast frontend development and
+  visual review without access to a real Claude home.
+
+### Changed
+- Rebuilt the interface as a dense graphite developer workbench: one restrained
+  accent, flatter surfaces, smaller radii, higher-contrast metadata, visible
+  keyboard focus, a status bar, responsive breakpoints, and reduced-motion
+  support.
+- Renamed **Tune** to **Instructions** and made long Claude optimization work cancellable.
+  Prompts now stream over stdin (avoiding Windows command-line limits), jobs have
+  concurrency and timeout guards, and CLAUDE.md/memory writes create backups.
+- Live refreshes are now path-aware and view-targeted. Expensive global aggregates
+  are deferred outside Overview, refreshes cannot overlap, and continuous writes
+  can no longer starve the trailing debounce.
+- Prompt-history search is incrementally indexed in memory instead of rereading
+  the full history file on every query. JSONL input is streamed line-by-line to
+  avoid a duplicate whole-file buffer.
+- Browser transcript growth is bounded during live tail-following; session-only
+  scratchpad watches and large reconstructed detail state are released on exit.
+- Cleanup renders large libraries in bounded chunks of 300 rows.
+- Codex ChatGPT-plan usage is never combined into a dollar-spend claim. Claude
+  pricing is labelled as an API-price estimate rather than a billing statement;
+  capabilities that only exist in one agent are explicitly gated.
+
+### Fixed
+- Deletion is revalidated in the backend. Sessions with transcript activity in
+  the last 10 minutes are conservatively protected, closing the gap where a quiet
+  but still-running task could previously become deletable after two minutes.
+- Settings, guidance, memory notes, and memory indexes use safer atomic writes;
+  guidance and overwritten memory content are backed up first.
+- Custom window controls are now shown only for the WSL workaround instead of
+  duplicating native Windows controls.
+- Clickable project/session/file rows are keyboard focusable, dialogs expose
+  dialog semantics and initial focus, toasts are announced, and muted text now
+  meets a substantially higher contrast target.
+
 ## [1.0.0] — 2026-07-18
 
 First stable release. The app now covers the full lifecycle — explore, analyze,

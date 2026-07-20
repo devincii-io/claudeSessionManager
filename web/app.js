@@ -1,5 +1,5 @@
 /* ============================================================
-   Claude Session Manager — frontend application
+   Agent Session Manager — frontend application
    Vanilla JS SPA talking to the Python backend over QWebChannel.
    ============================================================ */
 
@@ -7,6 +7,7 @@
 
 let backend = null;
 const State = {
+  agent: localStorage.getItem("csm.agent") || "all", // all | claude | codex
   projects: [],
   projectId: null,
   sessions: [],
@@ -21,15 +22,22 @@ const State = {
   selectMode: false,   // project session pane: select-to-delete mode
   cleanup: null,       // getAllSessions payload
   cleanupSort: "size", // size | age | cost
+  cleanupLimit: 300,
   tune: null,          // Tune view state (see loadTune)
+  paletteIndex: 0,
+  overviewDirty: false,
+  liveRefreshInFlight: false,
+  liveRefreshQueued: false,
 };
+
+const MAX_BROWSER_TRANSCRIPT_EVENTS = 1200;
 
 /* ---------- multiselect ---------- */
 
-function selKey(pid, sid) { return pid + "␟" + sid; }
-function isSel(pid, sid) { return State.sel.has(selKey(pid, sid)); }
+function selKey(pid, sid, provider = State.agent) { return provider + "␟" + pid + "␟" + sid; }
+function isSel(pid, sid, provider = State.agent) { return State.sel.has(selKey(pid, sid, provider)); }
 function toggleSel(rec) {
-  const k = selKey(rec.pid, rec.sid);
+  const k = selKey(rec.pid, rec.sid, rec.provider || State.agent);
   if (State.sel.has(k)) State.sel.delete(k); else State.sel.set(k, rec);
 }
 function clearSel() { State.sel.clear(); }
@@ -48,7 +56,7 @@ function selTotals() {
   return { count: State.sel.size, cost, bytes };
 }
 function selItems() {
-  return [...State.sel.values()].map((r) => ({ project_id: r.pid, session_id: r.sid }));
+  return [...State.sel.values()].map((r) => ({ provider: r.provider || State.agent, project_id: r.pid, session_id: r.sid }));
 }
 
 /* ---------- backend plumbing ---------- */
@@ -113,7 +121,7 @@ const MODEL_COLORS = {
   "claude-sonnet-4-6": "#6fb3ab",
   "claude-haiku-4-5": "#7fae6f",
 };
-const CHART_PALETTE = ["#d97757", "#7aa2c9", "#b98cc9", "#7fae6f", "#e0b64c", "#6fb3ab", "#e0956f"];
+const CHART_PALETTE = ["#78a9ff", "#9aa6b7", "#79c58a", "#c09ae8", "#d6b65c", "#66bfc3", "#e07a84"];
 function modelColor(m, i) { return MODEL_COLORS[m] || CHART_PALETTE[i % CHART_PALETTE.length]; }
 function shortModel(m) { return (m || "unknown").replace("claude-", ""); }
 
@@ -201,13 +209,33 @@ function renderRail() {
     !q || p.name.toLowerCase().includes(q) || (p.path || "").toLowerCase().includes(q));
   document.getElementById("project-list").innerHTML = list.map((p) => `
     <div class="project-item ${p.id === State.projectId ? "active" : ""}" data-action="project" data-id="${esc(p.id)}">
-      <div class="p-name">${p.active_count ? '<span class="dot-active"></span>' : ""}${esc(p.name)}</div>
+      <div class="p-name">${p.active_count ? '<span class="dot-active"></span>' : ""}${esc(p.name)} ${providerBadge(p.provider)}</div>
       <div class="p-meta">
         <span>${p.session_count} sess</span>
-        <span class="p-cost">${fmt.cost(p.total_cost)}</span>
+        ${p.provider === "codex" ? "" : `<span class="p-cost">${fmt.cost(p.total_cost)}</span>`}
         <span>${fmt.tokens(p.total_tokens)}</span>
       </div>
     </div>`).join("") || `<div class="faint" style="padding:10px;font-size:12px">No projects found.</div>`;
+  const count = document.getElementById("project-count");
+  if (count) count.textContent = String(list.length);
+  enhanceInteractive(document.getElementById("project-list"));
+  updateChrome();
+}
+
+const AGENTS = {
+  claude: { label: "Claude Code", short: "Claude", home: "~/.claude", command: "claude" },
+  codex: { label: "Codex", short: "Codex", home: "$CODEX_HOME", command: "codex" },
+  all: { label: "All agents", short: "All", home: "", command: "" },
+};
+function agentInfo(provider = State.agent) { return AGENTS[provider] || AGENTS.claude; }
+function currentProvider() {
+  const p = currentProject();
+  const s = State.sessions.find((x) => x.session_id === State.sessionId);
+  return (s && s.provider) || (p && p.provider) || (State.agent === "all" ? "claude" : State.agent);
+}
+function providerBadge(provider) {
+  if (!provider || (State.agent !== "all" && State.view !== "search")) return "";
+  return badge(agentInfo(provider).short, `provider-badge ${provider}`);
 }
 
 /* ---------- list pane ---------- */
@@ -223,6 +251,8 @@ function renderListPane() {
     el.style.display = "none";
     el.innerHTML = "";
   }
+  enhanceInteractive(el);
+  updateChrome();
 }
 
 function projectListPane() {
@@ -240,7 +270,7 @@ function projectListPane() {
         <span>${t.count ? `<b>${t.count}</b> selected · ${fmt.bytes(t.bytes)}` : "Tap sessions to select"}</span>
         <span style="display:flex;gap:6px">
           ${t.count ? `<button class="btn sm" data-action="sel-clear">Clear</button>
-          <button class="btn sm primary danger" data-action="bulk-delete">Delete ${t.count}</button>` : ""}
+          <button class="btn sm primary" data-action="bulk-delete">Clean up ${t.count}</button>` : ""}
         </span></div>` : ""}
     </div>
     <div class="list-body">
@@ -265,10 +295,11 @@ function sessionCard(s) {
   const title = s.title || s.first_prompt || "Untitled session";
   const badges = [];
   if (s.active) badges.push('<span class="badge green"><span class="dot-active"></span> live</span>');
+  if (s.provider) badges.push(providerBadge(s.provider));
   if (s.has_subagents) badges.push(badge("subagents", "magenta"));
   (s.models || []).slice(0, 2).forEach((m) => badges.push(badge(shortModel(m), "")));
   const sm = State.selectMode;
-  const sel = sm && isSel(State.projectId, s.session_id);
+  const sel = sm && isSel(State.projectId, s.session_id, s.provider);
   const cls = sel ? "sel" : (s.session_id === State.sessionId ? "active" : "");
   return `<div class="session-card ${sm ? "selectable" : ""} ${cls}" data-action="${sm ? "session-toggle" : "session"}" data-id="${esc(s.session_id)}">
     ${sm ? `<input type="checkbox" class="chk sc-chk" ${sel ? "checked" : ""} tabindex="-1">` : ""}
@@ -276,7 +307,7 @@ function sessionCard(s) {
     <div class="sc-meta">
       <span><b>${s.assistant_messages}</b> turns</span>
       <span><b>${s.tool_calls}</b> tools</span>
-      <span class="p-cost">${fmt.cost(s.cost)}</span>
+      ${s.provider === "codex" ? "" : `<span class="p-cost">${fmt.cost(s.cost)}</span>`}
       <span>${fmt.rel(s.updated || s.mtime)}</span>
     </div>
     <div style="margin-top:8px">${meterRow("ctx", s.context_pct, s.context_pct + "%")}</div>
@@ -288,15 +319,19 @@ function sessionCard(s) {
 
 function renderDetail() {
   const el = document.getElementById("detail-pane");
-  if (State.view === "settings") return void (el.innerHTML = settingsView());
-  if (State.view === "monitor") return void (el.innerHTML = monitorView());
-  if (State.view === "cleanup") return void (el.innerHTML = cleanupView());
-  if (State.view === "tune") return void (el.innerHTML = tuneView());
-  if (State.view === "search") return void (el.innerHTML = searchView());
-  if (State.view === "memory") return void (el.innerHTML = memoryView());
-  if (State.view === "session" && State.detail) return void (el.innerHTML = sessionView());
-  if (State.projectId) return void (el.innerHTML = projectView());
-  el.innerHTML = overviewView();
+  let html;
+  if (State.view === "settings") html = settingsView();
+  else if (State.view === "monitor") html = monitorView();
+  else if (State.view === "cleanup") html = cleanupView();
+  else if (State.view === "tune") html = tuneView();
+  else if (State.view === "search") html = searchView();
+  else if (State.view === "memory") html = memoryView();
+  else if (State.view === "session" && State.detail) html = sessionView();
+  else if (State.projectId) html = projectView();
+  else html = overviewView();
+  el.innerHTML = html;
+  enhanceInteractive(el);
+  updateChrome();
 }
 
 /* ---------- global search view ---------- */
@@ -333,7 +368,7 @@ async function runGlobalSearch(q) {
   State.searchQuery = q;
   State.searchResults = null;
   renderListPane(); renderDetail();
-  State.searchResults = await call("searchAll", q);
+  State.searchResults = await call("searchProvider", State.agent, q);
   renderDetail();
 }
 
@@ -347,7 +382,7 @@ function overviewView() {
   const ctxTotal = (u.input || 0) + (u.cache_read || 0) + (u.cache_write || 0);
   const cacheHit = ctxTotal ? (100 * (u.cache_read || 0) / ctxTotal) : 0;
 
-  const costBars = [...P].sort((a, b) => b.total_cost - a.total_cost).slice(0, 8).map((p, i) => ({
+  const costBars = P.filter((p) => p.provider !== "codex").sort((a, b) => b.total_cost - a.total_cost).slice(0, 8).map((p, i) => ({
     label: p.name, value: p.total_cost, valueText: fmt.cost(p.total_cost), color: CHART_PALETTE[i % CHART_PALETTE.length],
   }));
   const models = Object.entries(g.by_model || {}).filter(([, v]) => (v.total || 0) > 0)
@@ -357,34 +392,53 @@ function overviewView() {
     .map(([name, n]) => ({ label: name, value: n, valueText: fmt.num(n) }));
   const dayVals = (g.sessions_by_day || []).map(([, n]) => n);
   const dayLabels = (g.sessions_by_day || []).map(([d]) => d.slice(8));
+  const recent = P[0];
+  const info = agentInfo();
+  const costKnown = State.agent !== "codex";
+  const launchProvider = recent && recent.provider;
+  const launchLabel = State.agent === "all" && launchProvider ? `New ${agentInfo(launchProvider).label} session` : `New ${info.label} session`;
 
   return `<div class="detail-inner">
-    <div class="page-head"><div><h1>Overview</h1><div class="ph-sub">Everything Claude Code has done on this machine — all projects, all sessions</div></div>
-      <div class="page-actions"><button class="btn sm" data-action="open-home" title="Open the Claude data folder in your file manager">Open ~/.claude</button></div></div>
+    <div class="page-head"><div><h1>Overview</h1><div class="ph-sub">Local ${esc(info.label)} projects and sessions, indexed in one developer workbench</div></div>
+      <div class="page-actions">${State.agent === "all" ? '<button class="btn sm" data-action="switch-agent" data-agent="claude">Claude data</button><button class="btn sm" data-action="switch-agent" data-agent="codex">Codex data</button>' : `<button class="btn sm" data-action="open-home">Open ${esc(info.home)}</button>`}</div></div>
+    <div class="quick-launch" aria-label="Quick launch">
+      <button class="quick-action primary" data-action="launch-new" data-path="${esc(recent && recent.path || "")}">
+        <strong>${esc(launchLabel)}</strong><span>${recent ? `Start in ${esc(recent.name)} · Ctrl N` : "Choose a project first"}</span>
+      </button>
+      <button class="quick-action" data-action="open-editor" data-path="${esc(recent && recent.path || "")}">
+        <strong>Open recent project</strong><span>${recent ? esc(recent.name) + " in VS Code" : "No recent project"}</span>
+      </button>
+      <button class="quick-action" data-action="show-commands">
+        <strong>Command launcher</strong><span>Every action · Ctrl Shift P</span>
+      </button>
+      <button class="quick-action" data-action="focus-search">
+        <strong>Search history</strong><span>Sessions and prompts · Ctrl Shift F</span>
+      </button>
+    </div>
     <div class="tiles">
-      ${tile("Total spend", fmt.cost(g.cost), fmt.cost(g.sessions ? g.cost / g.sessions : 0) + " avg / session", true,
-        "Estimated from per-model token usage and list prices (cache reads ~0.1x, cache writes ~1.25x input price)")}
+      ${costKnown ? tile(State.agent === "all" ? "Claude API-price estimate" : "API-price estimate", fmt.cost(g.cost), "Not a billing statement", true,
+        "Estimated from Claude model token usage; Codex ChatGPT-plan usage has no dollar amount here") : tile("Usage", "ChatGPT plan", "No dollar cost inferred", true, "Codex local token records do not prove API billing")}
       ${tile("Tokens", fmt.tokens(u.total), fmt.tokens(u.output) + " generated",
         false, "All tokens across every session: input + output + cache reads/writes")}
       ${tile("Cache hit rate", cacheHit.toFixed(0) + "%", fmt.tokens(u.cache_read) + " served from cache",
         false, "Share of context tokens served from the prompt cache — cache reads cost ~10x less than fresh input")}
-      ${tile("Sessions", g.sessions, g.active + " live · " + P.length + " projects",
-        false, "Every transcript under ~/.claude/projects; live = written to in the last 2 minutes")}
+      ${tile("Sessions", g.sessions, g.active + " recently active · " + P.length + " projects",
+        false, "Local Claude and Codex session files; recent activity means written in the last 2 minutes")}
     </div>
     <div class="tiles">
       ${tile("Prompts", fmt.num(g.prompts), "messages you sent", false, "User messages across all sessions (tool results excluded)")}
       ${tile("Assistant turns", fmt.num(g.turns), "API responses", false, "Deduplicated assistant responses across all sessions")}
       ${tile("Tool calls", fmt.num(g.tool_calls), Object.keys(g.tool_counts || {}).length + " distinct tools",
-        false, "Bash, Edit, Read, subagents… every tool invocation Claude made")}
-      ${tile("Subagent sessions", g.subagent_sessions, "used Agent/Task", false, "Sessions that spawned subagents or used the Agent/Task tools")}
+        false, "Shell, edit, read, search, and agent tool invocations")}
+      ${tile("Subagent sessions", g.subagent_sessions, "detected locally", false, "Best-effort count of sessions that spawned subagents")}
     </div>
-    <div class="section"><div class="section-title">Spend by project</div>
+    ${costKnown ? `<div class="section"><div class="section-title">${State.agent === "all" ? "Claude estimate" : "API-price estimate"} by project</div>
       ${desc("Estimated cost of every session, grouped by the project it ran in.")}
-      <div class="card">${costBars.length ? barChart(costBars) : '<div class="faint">No data.</div>'}</div></div>
-    ${donutItems.length ? `<div class="section"><div class="section-title">Models — tokens & cost</div>
-      ${desc("Which models did the work, and what each one cost across all sessions.")}
+      <div class="card">${costBars.length ? barChart(costBars) : '<div class="faint">No data.</div>'}</div></div>` : ""}
+    ${donutItems.length ? `<div class="section"><div class="section-title">Models — ${costKnown ? "tokens and Claude estimate" : "tokens"}</div>
+      ${desc(costKnown ? "Token share and the Claude API-price estimate by model." : "Token share by model; no billing amount is inferred.")}
       <div class="card"><div style="display:flex;gap:28px;align-items:center;flex-wrap:wrap">${donut(donutItems)}
-        <div class="legend">${models.map(([m, v], i) => `<div class="legend-item"><span class="legend-swatch" style="background:${modelColor(m, i)}"></span>${esc(shortModel(m))} <b style="color:var(--text)">${fmt.cost(v.cost)}</b> <span class="faint">${fmt.tokens(v.total)} tok</span></div>`).join("")}</div>
+        <div class="legend">${models.map(([m, v], i) => `<div class="legend-item"><span class="legend-swatch" style="background:${modelColor(m, i)}"></span>${esc(shortModel(m))} ${costKnown && v.cost != null ? `<b style="color:var(--text)">${fmt.cost(v.cost)}</b>` : ""} <span class="faint">${fmt.tokens(v.total)} tok</span></div>`).join("")}</div>
       </div></div></div>` : ""}
     <div class="section"><div class="section-title">Activity — last 14 days</div>
       ${desc("Sessions with activity per day (by last write to the transcript).")}
@@ -426,12 +480,13 @@ function projectView() {
     <div class="page-head">
       <div><h1>${esc(p.name)}</h1><div class="ph-sub mono">${esc(p.path || p.id)}</div></div>
       <div class="page-actions">
+        <button class="btn sm primary" data-action="launch-new" data-path="${esc(p.path)}">New session</button>
         <button class="btn sm" data-action="open-editor" data-path="${esc(p.path)}">VS Code</button>
         <button class="btn sm" data-action="open-folder" data-path="${esc(p.path)}">Open folder</button>
       </div>
     </div>
     <div class="tiles">
-      ${tile("Spend", fmt.cost(totalCost), null, true)}
+      ${p.provider === "codex" ? tile("Usage", "ChatGPT plan", "No dollar cost inferred", true) : tile("API-price estimate", fmt.cost(totalCost), "Not a billing statement", true)}
       ${tile("Tokens", fmt.tokens(totalTokens))}
       ${tile("Sessions", sessions.length, p.active_count + " active")}
       ${tile("Tool calls", fmt.num(totalTools))}
@@ -449,23 +504,26 @@ function sessionView() {
   const d = State.detail;
   const s = State.sessions.find((x) => x.session_id === State.sessionId) || {};
   const title = s.title || s.first_prompt || "Session";
+  const provider = s.provider || currentProvider();
   const tabs = [
     ["analytics", "Analytics"],
     ["transcript", "Transcript (" + (d.total_events || 0) + ")"],
     ["subagents", "Subagents (" + ((d.subagents && d.subagents.count) || 0) + ")"],
-    ["tasks", "Tasks (" + (d.tasks || []).length + ")"],
-    ["scratchpad", "Workspace (" + ((d.scratchpad && d.scratchpad.files || []).length) + ")"],
-    ["images", "Images (" + ((d.images || []).length) + ")"],
+    ...(provider === "claude" ? [["tasks", "Tasks (" + (d.tasks || []).length + ")"],
+      ["scratchpad", "Workspace (" + ((d.scratchpad && d.scratchpad.files || []).length) + ")"],
+      ["images", "Images (" + ((d.images || []).length) + ")"]] : []),
     ["raw", "Raw"],
   ];
   return `<div class="detail-inner">
     <div class="page-head">
       <div><h1>${esc(title)}</h1>
-        <div class="ph-sub mono">${esc(State.sessionId)} · ${(s.models || []).map(shortModel).join(", ")}</div></div>
+        <div class="ph-sub mono">${providerBadge(provider)} ${esc(State.sessionId)} · ${(s.models || []).map(shortModel).join(", ")}</div></div>
       <div class="page-actions">
-        <button class="btn sm" data-action="copy-resume" title="Copy: claude --resume">Copy resume</button>
+        <button class="btn sm primary" data-action="launch-resume" title="Resume this session in a terminal (Ctrl+Enter)">Resume</button>
+        ${provider === "codex" ? '<button class="btn sm" data-action="launch-fork">Fork</button>' : ""}
+        <button class="btn sm" data-action="copy-resume">Copy command</button>
         <button class="btn sm" data-action="open-jsonl">Open .jsonl</button>
-        <button class="btn sm danger" data-action="delete-session">Delete</button>
+        ${s.protected ? '<button class="btn sm" disabled title="Cleanup unlocks after 10 minutes without transcript activity">Recently active</button>' : (provider === "codex" ? '<button class="btn sm" data-action="archive-session">Archive</button>' : '<button class="btn sm danger" data-action="delete-session">Delete</button>')}
       </div>
     </div>
     <div class="tabs">${tabs.map(([k, l]) => `<button class="tab ${State.tab === k ? "active" : ""}" data-action="tab" data-tab="${k}">${l}</button>`).join("")}</div>
@@ -564,6 +622,31 @@ function durationText(a, b) {
   return Math.floor(m / 60) + "h " + (m % 60) + "m";
 }
 
+function sessionHealth(d) {
+  const summary = State.sessions.find((x) => x.session_id === State.sessionId) || {};
+  const analytics = d.analytics || {};
+  const context = Number(summary.context_pct || 0);
+  const compactions = Number(analytics.compactions || 0);
+  const errors = Number(analytics.tool_error_total || 0);
+  const calls = Number(analytics.tool_calls || 0);
+  const errorRate = calls ? 100 * errors / calls : 0;
+  let level = "healthy", label = "Roomy";
+  let guidance = "Good candidate to resume. Long wall-clock duration alone is not a problem.";
+  if (context >= 80 || compactions >= 4 || errorRate >= 15) {
+    level = "attention"; label = "Near limit";
+    guidance = "Context pressure, repeated compaction, or tool errors suggest compacting with a clear focus or starting fresh with a handoff.";
+  } else if (context >= 60 || compactions >= 2 || errorRate >= 8) {
+    level = "watch"; label = "Filling";
+    guidance = "The session is still usable. Consider a focused compact before the next large phase of work.";
+  }
+  return `<div class="health-panel ${level}">
+    <div class="health-main"><span class="health-state">${esc(label)}</span>
+      <div><strong>Context status <span class="faint">· estimate</span></strong><p>${esc(guidance)}</p></div></div>
+    <div class="health-metrics"><span>context <b>${context.toFixed(0)}%</b></span><span>compactions <b>${compactions}</b></span><span>tool errors <b>${errorRate.toFixed(1)}%</b></span></div>
+    <div class="health-actions"><button class="btn sm" data-action="copy-compact">Copy /compact</button><button class="btn sm" data-action="launch-new">Start fresh</button></div>
+  </div>`;
+}
+
 function analyticsTab(d) {
   const u = d.usage || {};
   const a = d.analytics || {};
@@ -588,10 +671,12 @@ function analyticsTab(d) {
   const turns = a.assistant_turns || 1;
   const thinkShare = (a.thinking_chars + a.text_chars) ? (100 * a.thinking_chars / (a.thinking_chars + a.text_chars)) : 0;
   const errRate = a.tool_calls ? (100 * a.tool_error_total / a.tool_calls) : 0;
+  const provider = currentProvider();
+  const costKnown = provider !== "codex";
 
-  return `<div class="tiles">
-      ${tile("Cost", fmt.cost(d.cost), "$" + (d.cost / turns).toFixed(3) + " / turn", true,
-        "Estimated from this session's per-model token usage at list prices")}
+  return `${sessionHealth(d)}<div class="tiles">
+      ${costKnown ? tile("API-price estimate", fmt.cost(d.cost), "Not a billing statement", true,
+        "Estimated from this session's Claude model usage at list prices") : tile("Usage", "ChatGPT plan", "No dollar cost inferred", true)}
       ${tile("Total tokens", fmt.tokens(u.total), fmt.tokens(Math.round((u.output || 0) / turns)) + " out / turn",
         false, "Input + output + cache reads/writes for this session")}
       ${tile("Cache hit rate", cacheHit.toFixed(0) + "%", fmt.tokens(u.cache_read) + " read",
@@ -606,8 +691,8 @@ function analyticsTab(d) {
         false, "Tool results that came back as errors (failed commands, bad edits…)")}
       ${tile("Compactions", a.compactions || 0, "context resets",
         false, "Times the conversation was compacted/summarized to free context — the context meter drops sharply at each one")}
-      ${tile("Thinking share", thinkShare.toFixed(0) + "%", "of generated text",
-        false, "How much of Claude's generated text was internal reasoning rather than visible replies")}
+      ${tile("Reasoning share", thinkShare.toFixed(0) + "%", "of generated text",
+        false, "How much generated text was reasoning rather than visible replies")}
     </div>
     <div class="section"><div class="section-title">Token composition</div><div class="card">
       ${barChart([
@@ -618,9 +703,9 @@ function analyticsTab(d) {
       ])}</div></div>
     ${donutItems.length ? `<div class="section"><div class="section-title">Tokens by model</div><div class="card">
       <div style="display:flex;gap:28px;align-items:center;flex-wrap:wrap">${donut(donutItems)}
-      <div class="legend">${costByModel.map(([m, v], i) => `<div class="legend-item"><span class="legend-swatch" style="background:${modelColor(m, i)}"></span>${esc(shortModel(m))} <b style="color:var(--text)">${fmt.cost(v.cost)}</b> <span class="faint">${fmt.tokens(v.total)} tok · ${fmt.tokens(v.output)} out</span></div>`).join("")}</div></div></div></div>` : ""}
+      <div class="legend">${costByModel.map(([m, v], i) => `<div class="legend-item"><span class="legend-swatch" style="background:${modelColor(m, i)}"></span>${esc(shortModel(m))} ${costKnown && v.cost != null ? `<b style="color:var(--text)">${fmt.cost(v.cost)}</b>` : ""} <span class="faint">${fmt.tokens(v.total)} tok · ${fmt.tokens(v.output)} out</span></div>`).join("")}</div></div></div></div>` : ""}
     <div class="section"><div class="section-title">Context window over time · ${a.compactions || 0} compaction${(a.compactions || 0) === 1 ? "" : "s"}</div><div class="card">${sparkline(ctxPoints, "#7aa2c9")}</div></div>
-    <div class="section"><div class="section-title">Cumulative cost</div><div class="card">${sparkline(costPoints, "#d97757")}</div></div>
+    ${costKnown ? `<div class="section"><div class="section-title">Cumulative API-price estimate</div><div class="card">${sparkline(costPoints, "#d97757")}</div></div>` : ""}
     ${outPoints.length > 1 ? `<div class="section"><div class="section-title">Output tokens per turn</div><div class="card">${sparkline(outPoints, "#7fae6f")}</div></div>` : ""}
     <div class="section"><div class="section-title">Activity by hour (UTC)</div><div class="card">${columns(a.hourly_utc || [], "#e0b64c", Array.from({ length: 24 }, (_, i) => i))}</div></div>
     ${toolBars.length ? `<div class="section"><div class="section-title">Tool usage</div><div class="card">${barChart(toolBars)}</div></div>` : ""}
@@ -670,15 +755,17 @@ function scratchpadTab(d) {
 }
 
 function rawTab(d) {
-  const jsonl = `${State.claudeHome || ""}/projects/${State.projectId}/${State.sessionId}.jsonl`;
+  const jsonl = d.path || "";
   const fh = d.file_history || {};
+  const provider = currentProvider();
+  const resume = provider === "codex" ? `codex resume ${State.sessionId}` : `claude --resume ${State.sessionId}`;
   return `<div class="card">
     <div class="kv">
       <div class="k">Session ID</div><div class="v">${esc(State.sessionId)}</div>
       <div class="k">Transcript</div><div class="v">${esc(jsonl)}</div>
       <div class="k">Events (shown)</div><div class="v">${(d.events || []).length}${d.truncated ? " (truncated)" : ""}</div>
       <div class="k">File checkpoints</div><div class="v">${fh.count || 0} snapshots · ${fmt.bytes(fh.bytes)}</div>
-      <div class="k">Resume</div><div class="v">claude --resume ${esc(State.sessionId)}</div>
+      <div class="k">Resume</div><div class="v">${esc(resume)}</div>
     </div>
     <div style="margin-top:14px;display:flex;gap:8px">
       <button class="btn" data-action="open-jsonl">Open transcript in editor</button>
@@ -863,7 +950,27 @@ function privacyRow(merged, item) {
   </div>`;
 }
 
+function codexSettingsView() {
+  const s = State.settings || {};
+  const cfg = State.configFiles || [];
+  return `<div class="detail-inner">
+    <div class="page-head"><div><h1>Codex settings</h1><div class="ph-sub mono">${esc(s.home || State.agentHome || "$CODEX_HOME")}</div></div>
+      <div class="page-actions"><button class="btn sm" data-action="open-folder" data-path="${esc(s.home || State.agentHome || "")}">Open Codex home</button></div></div>
+    <div class="notice"><strong>Safe configuration surface.</strong> Edit only <span class="mono">config.toml</span> and <span class="mono">AGENTS.md</span> here. Credentials, SQLite state, encrypted reasoning, and sandbox secrets are never exposed.</div>
+    <div class="section"><div class="section-title">Configuration and instructions</div>
+      ${desc("Codex owns the TOML schema and session indexes. Existing files are backed up before this app writes them.")}
+      <div class="config-layout"><div class="config-files">${cfg.map((f) => `<button class="cfg-file ${State._cfgFile === f.path ? "active" : ""}" data-action="cfg-file" data-path="${esc(f.path)}"><span>${esc(f.name)}</span><small>${esc(f.group || "Codex")}${f.missing ? " · new" : ` · ${fmt.bytes(f.size)}`}</small></button>`).join("")}</div>
+      <div id="cfg-editor" class="config-editor">${State._cfgFile ? '<div class="skeleton">Select the file again to load it.</div>' : '<div class="empty"><h3>Select config.toml or AGENTS.md</h3><p>Project AGENTS.md appears when a project is selected.</p></div>'}</div></div>
+    </div>
+    <div class="section"><div class="section-title">Agent capabilities</div><div class="card">
+      <div class="setting-row"><div class="s-main"><div class="s-label">Sessions and transcripts</div><div class="s-desc">Best-effort local adapter; unknown future events are skipped safely.</div></div>${badge("available", "green")}</div>
+      <div class="setting-row"><div class="s-main"><div class="s-label">Tasks, scratchpads, images, statusline</div><div class="s-desc">Claude-specific on-disk features are intentionally not fabricated for Codex.</div></div>${badge("Claude only")}</div>
+    </div></div></div>`;
+}
+
 function settingsView() {
+  if (State.agent === "codex") return codexSettingsView();
+  if (State.agent === "all") return `<div class="detail-inner">${emptyState("S", "Choose an agent", "Settings are intentionally separate. Select Claude or Codex so configuration never crosses agent boundaries.")}<div class="quick-launch"><button class="quick-action" data-action="switch-agent" data-agent="claude" data-next="settings"><strong>Claude Code settings</strong><span>settings.json, privacy, statusline</span></button><button class="quick-action" data-action="switch-agent" data-agent="codex" data-next="settings"><strong>Codex settings</strong><span>config.toml and AGENTS.md</span></button></div></div>`;
   const s = State.settings;
   if (!s) return `<div class="detail-inner"><div class="skeleton">Loading settings…</div></div>`;
   const merged = s.merged || {};
@@ -1032,6 +1139,11 @@ async function addCustomEnv() {
 /* ---------- monitor view ---------- */
 
 function monitorView() {
+  if (State.agent === "codex") return `<div class="detail-inner"><div class="page-head"><div><h1>Monitor</h1><div class="ph-sub">Recently active Codex session files</div></div></div>
+    <div class="notice"><strong>Activity is inferred from file writes.</strong> A recent timestamp does not prove that a Codex process is currently running.</div>
+    <div class="section"><div class="section-title">Recent projects</div><div class="card">${State.projects.slice(0, 12).map((p) => `<div class="setting-row" data-action="project" data-id="${esc(p.id)}"><div class="s-main"><div class="s-label">${esc(p.name)}</div><div class="s-desc mono">${esc(p.path || "")}</div></div><span>${p.active_count || 0} recent · ${p.session_count} sessions</span></div>`).join("") || '<div class="faint">No Codex sessions indexed.</div>'}</div></div>
+    <div class="section"><div class="section-title">Unavailable from Codex session storage</div><div class="card"><p class="faint">Shell snapshots, captured rate limits, and Claude statusline hooks are not shown. The app does not infer them from unrelated logs or credentials.</p></div></div></div>`;
+  if (State.agent === "all") return `<div class="detail-inner">${emptyState("M", "Choose an agent", "Runtime monitoring has agent-specific capabilities. Select Claude or Codex above.")}</div>`;
   const active = [];
   State.projects.forEach((p) => { if (p.active_count) active.push(p); });
   const live = State.settings && State.settings.live;
@@ -1082,7 +1194,7 @@ const PRESETS = [
 ];
 
 function cleanupRec(s) {
-  return { pid: s.project_id, sid: s.session_id, title: s.title, cost: s.cost, bytes: (s.size_bytes || 0) + (s.extra_bytes || 0) };
+  return { provider: s.provider || State.agent, pid: s.project_id, sid: s.session_id, title: s.title, cost: s.cost, bytes: (s.size_bytes || 0) + (s.extra_bytes || 0) };
 }
 
 function sortedCleanup(sessions) {
@@ -1094,7 +1206,7 @@ function sortedCleanup(sessions) {
 }
 
 function applyPreset(id) {
-  const list = ((State.cleanup && State.cleanup.sessions) || []).filter((s) => !s.active);
+  const list = ((State.cleanup && State.cleanup.sessions) || []).filter((s) => !s.protected);
   const now = Date.now();
   clearSel();
   let matched;
@@ -1110,7 +1222,7 @@ function applyPreset(id) {
       return false;
     });
   }
-  matched.forEach((s) => State.sel.set(selKey(s.project_id, s.session_id), cleanupRec(s)));
+  matched.forEach((s) => State.sel.set(selKey(s.project_id, s.session_id, s.provider), cleanupRec(s)));
   renderDetail();
   if (!matched.length) toast("No sessions match that filter", "");
 }
@@ -1118,32 +1230,34 @@ function applyPreset(id) {
 function cleanupView() {
   const c = State.cleanup;
   if (!c) return `<div class="detail-inner"><div class="skeleton">Scanning every session on disk…</div></div>`;
-  const list = sortedCleanup(c.sessions);
+  const fullList = sortedCleanup(c.sessions);
+  const list = fullList.slice(0, State.cleanupLimit);
   const t = selTotals();
   const sort = State.cleanupSort;
   const sortBtn = (k, l) => `<button class="chip ${sort === k ? "on" : ""}" data-action="cleanup-sort" data-sort="${k}">${l}</button>`;
   return `<div class="detail-inner">
     <div class="page-head"><div><h1>Cleanup</h1>
-      <div class="ph-sub">Reclaim disk space — multi-select old, small or heavy sessions and delete them together. Live sessions are protected.</div></div>
-      <div class="page-actions"><button class="btn sm" data-action="open-home" title="Open the Claude data folder">Open ~/.claude</button></div></div>
+      <div class="ph-sub">Claude sessions are deleted; Codex sessions are archived through its CLI. Recent writes stay protected for 10 minutes.</div></div>
+      <div class="page-actions">${State.agent === "all" ? "" : `<button class="btn sm" data-action="open-home">Open ${esc(agentInfo().home)}</button>`}</div></div>
     <div class="tiles">
       ${tile("Sessions", c.sessions.length, fmt.bytes(c.total_bytes) + " on disk", false,
         "Every transcript plus its ancillary data (tasks, file-history, images, session-env)")}
-      ${tile("Selected", t.count, fmt.cost(t.cost) + " of history", !!t.count, "Sessions currently checked for deletion")}
-      ${tile("Reclaims", fmt.bytes(t.bytes), t.count ? "delete + purge" : "nothing selected", !!t.count,
-        "Approximate disk space freed if you delete the current selection with purge on")}
+      ${tile("Selected", t.count, State.agent === "claude" ? fmt.cost(t.cost) + " estimate" : "ready for cleanup", !!t.count, "Sessions currently checked")}
+      ${tile("Reclaims", fmt.bytes(t.bytes), t.count ? "estimated on-disk size" : "nothing selected", !!t.count,
+        "Codex archives remain recoverable; Claude deletion can reclaim this storage")}
     </div>
     <div class="section">
       <div class="cleanup-toolbar">
         <span class="tb-label">Quick select</span>
-        ${PRESETS.map(([id, l, tip]) => `<button class="chip" data-action="cleanup-preset" data-preset="${id}" title="${esc(tip)}">${l}</button>`).join("")}
+        ${PRESETS.filter(([id]) => id !== "cheap" || State.agent === "claude").map(([id, l, tip]) => `<button class="chip" data-action="cleanup-preset" data-preset="${id}" title="${esc(tip)}">${l}</button>`).join("")}
         <button class="chip" data-action="sel-all">All</button>
         <button class="chip" data-action="sel-clear">None</button>
         <span class="tb-label" style="margin-left:auto">Sort</span>
-        ${sortBtn("size", "Size")}${sortBtn("age", "Age")}${sortBtn("cost", "Cost")}
+        ${sortBtn("size", "Size")}${sortBtn("age", "Age")}${State.agent === "claude" ? sortBtn("cost", "Cost") : ""}
       </div>
       <div class="clean-list">
         ${list.map(cleanupRow).join("") || '<div class="faint" style="padding:14px">No sessions on disk.</div>'}
+        ${fullList.length > list.length ? `<button class="btn" data-action="cleanup-more" style="justify-content:center">Show 300 more · ${fullList.length - list.length} remaining</button>` : ""}
       </div>
     </div>
     ${selBar()}
@@ -1151,20 +1265,22 @@ function cleanupView() {
 }
 
 function cleanupRow(s) {
-  const sel = isSel(s.project_id, s.session_id);
+  const sel = isSel(s.project_id, s.session_id, s.provider);
+  const locked = !!s.protected;
   const size = (s.size_bytes || 0) + (s.extra_bytes || 0);
   const tags = [];
   if (s.active) tags.push('<span class="badge green"><span class="dot-active"></span> live</span>');
   if (s.has_subagents) tags.push(badge("subagents", "magenta"));
-  return `<div class="clean-row ${sel ? "sel" : ""} ${s.active ? "live" : ""}" data-action="cleanup-row" data-pid="${esc(s.project_id)}" data-sid="${esc(s.session_id)}">
-    ${s.active ? '<span class="chk-lock" title="Live session — protected">🔒</span>' : `<input type="checkbox" class="chk" ${sel ? "checked" : ""} tabindex="-1">`}
+  tags.push(providerBadge(s.provider));
+  return `<div class="clean-row ${sel ? "sel" : ""} ${locked ? "live" : ""}" data-action="cleanup-row" data-provider="${esc(s.provider || State.agent)}" data-pid="${esc(s.project_id)}" data-sid="${esc(s.session_id)}">
+    ${locked ? '<span class="chk-lock" title="Recently active — deletion is temporarily blocked">🔒</span>' : `<input type="checkbox" class="chk" ${sel ? "checked" : ""} tabindex="-1">`}
     <div class="cr-main">
       <div class="cr-title">${esc(s.title)}</div>
       <div class="cr-meta"><span class="cr-proj">${esc(s.project_name)}</span>
         <span>${s.assistant_messages} turns</span><span>${s.tool_calls} tools</span>
         <span>${fmt.rel(s.mtime)}</span>${tags.join("")}</div>
     </div>
-    <div class="cr-nums"><span class="p-cost">${fmt.cost(s.cost)}</span><span class="cr-size">${fmt.bytes(size)}</span></div>
+    <div class="cr-nums">${s.provider === "codex" ? "" : `<span class="p-cost">${fmt.cost(s.cost)}</span>`}<span class="cr-size">${fmt.bytes(size)}</span></div>
   </div>`;
 }
 
@@ -1172,16 +1288,16 @@ function selBar() {
   const t = selTotals();
   if (!t.count) return "";
   return `<div class="sel-bar">
-    <div class="sb-info"><b>${t.count}</b> selected · <span class="p-cost">${fmt.cost(t.cost)}</span> · reclaims <b>${fmt.bytes(t.bytes)}</b></div>
+    <div class="sb-info"><b>${t.count}</b> selected · <b>${fmt.bytes(t.bytes)}</b> indexed</div>
     <button class="btn sm" data-action="sel-clear">Clear</button>
-    <button class="btn sm primary danger" data-action="bulk-delete">Delete ${t.count} session${t.count === 1 ? "" : "s"}</button>
+    <button class="btn sm primary" data-action="bulk-delete">Clean up ${t.count} session${t.count === 1 ? "" : "s"}</button>
   </div>`;
 }
 
 async function loadCleanup() {
-  State.cleanup = null; clearSel();
+  State.cleanup = null; State.cleanupLimit = 300; clearSel();
   renderDetail();
-  State.cleanup = await call("getAllSessions");
+  State.cleanup = await call("getProviderAllSessions", State.agent);
   renderDetail();
 }
 
@@ -1189,14 +1305,16 @@ function confirmBulkDelete() {
   const t = selTotals();
   if (!t.count) return;
   const items = selItems();
-  const extra = `<label class="checkbox-row"><input type="checkbox" id="bulk-purge" checked> Also purge tasks, file-history, image-cache &amp; env (reclaims more space)</label>`;
-  modal(`Delete ${t.count} session${t.count === 1 ? "" : "s"}?`,
-    `Permanently deletes ${t.count} transcript${t.count === 1 ? "" : "s"} — about ${fmt.cost(t.cost)} of history and ${fmt.bytes(t.bytes)} on disk. This cannot be undone.`,
+  const hasClaude = items.some((x) => x.provider === "claude");
+  const hasCodex = items.some((x) => x.provider === "codex");
+  const extra = hasClaude ? `<label class="checkbox-row"><input type="checkbox" id="bulk-purge" checked> Also purge Claude tasks, file-history, image-cache &amp; env</label>` : "";
+  modal(`Clean up ${t.count} session${t.count === 1 ? "" : "s"}?`,
+    `${hasClaude ? "Claude transcripts will be permanently deleted. " : ""}${hasCodex ? "Codex sessions will be archived through the Codex CLI and remain recoverable. " : ""}${fmt.bytes(t.bytes)} is currently indexed.`,
     async () => {
       const purge = document.getElementById("bulk-purge") && document.getElementById("bulk-purge").checked;
-      const r = await call("deleteSessions", JSON.stringify(items), !!purge);
+      const r = await call("cleanupSessions", JSON.stringify(items), !!purge);
       if (r && r.ok) {
-        toast(`Deleted ${r.deleted} session${r.deleted === 1 ? "" : "s"}`, "ok");
+        toast(`Cleaned up ${r.completed || r.deleted || 0} session${(r.completed || r.deleted) === 1 ? "" : "s"}`, "ok");
         clearSel();
         await loadOverview();
         if (State.view === "cleanup") await loadCleanup();
@@ -1219,6 +1337,7 @@ function tuneContextItems() {
 }
 
 async function loadTune() {
+  if (State.agent !== "claude") { State.tune = {}; renderDetail(); return; }
   if (!State.tune) {
     State.tune = {
       mode: "guidance",       // guidance | memory
@@ -1253,11 +1372,16 @@ async function tuneRefreshGuidance() {
 }
 
 function tuneView() {
+  if (State.agent === "codex") return `<div class="detail-inner"><div class="page-head"><div><h1>Instructions</h1><div class="ph-sub">Codex reads durable guidance from AGENTS.md</div></div><div class="page-actions"><button class="btn sm" data-action="open-agents">Open AGENTS.md</button></div></div>
+    <div class="notice"><strong>Agent-specific by design.</strong> CLAUDE.md and AGENTS.md are not automatically synchronized because their semantics can differ.</div>
+    <div class="section"><div class="section-title">Edit Codex guidance</div><div class="card"><p>Use the Codex settings view to edit global or project <span class="mono">AGENTS.md</span> with automatic backups.</p><button class="btn primary" data-action="goto-codex-settings">Open Codex settings</button></div></div>
+    <div class="section"><div class="section-title">Long-session guidance</div><div class="card"><p class="faint">Long elapsed time alone is harmless. Start a focused session when context is noisy or near its limit, and keep durable repository rules in AGENTS.md.</p></div></div></div>`;
+  if (State.agent === "all") return `<div class="detail-inner">${emptyState("I", "Choose an agent", "Instructions stay separate. Select Claude for CLAUDE.md or Codex for AGENTS.md.")}</div>`;
   const t = State.tune;
   if (!t) return `<div class="detail-inner"><div class="skeleton">Loading…</div></div>`;
   const modeChip = (k, l) => `<button class="chip ${t.mode === k ? "on" : ""}" data-action="tune-mode" data-mode="${k}">${l}</button>`;
   return `<div class="detail-inner">
-    <div class="page-head"><div><h1>Tune</h1>
+    <div class="page-head"><div><h1>Claude instructions</h1>
       <div class="ph-sub">Put your own signed-in Claude to work on your history — refine CLAUDE.md guidance or distill sessions into memory. Runs the local <span class="mono">claude</span> CLI; nothing leaves your machine beyond a normal Claude request.</div></div></div>
     <div class="seg">${modeChip("guidance", "✦ Refine CLAUDE.md")}${modeChip("memory", "◇ Consolidate → memory")}</div>
     ${t.mode === "guidance" ? tuneGuidance(t) : tuneMemory(t)}
@@ -1349,7 +1473,7 @@ function tuneNotes(t) {
 }
 
 function tuneStatus(t) {
-  if (t.busy) return `<div class="tune-status"><span class="spinner"></span>Running <span class="mono">claude</span> on your history — this can take a bit…</div>`;
+  if (t.busy) return `<div class="tune-status"><span class="spinner"></span>Running <span class="mono">claude</span> on your history — this can take a bit… <button class="btn sm" data-action="tune-cancel">Cancel</button></div>`;
   if (t.error) return `<div class="tune-err">⚠ ${esc(t.error)}</div>`;
   return "";
 }
@@ -1408,7 +1532,7 @@ async function saveTuneGuidance() {
   const proj = t.scope === "project" ? projById(t.projectId) : null;
   const r = await call("saveGuidance", t.scope, content, proj ? (proj.path || "") : "");
   if (r && r.ok) {
-    toast("Saved " + r.path.split("/").pop(), "ok");
+    toast("Saved " + r.path.split("/").pop() + (r.backup ? " · previous version backed up" : ""), "ok");
     t.guidance = { ok: true, exists: true, path: r.path, content };
     t.proposal = null;
     renderDetail();
@@ -1437,19 +1561,22 @@ function emptyState(ic, title, sub) {
 /* ---------- data loaders ---------- */
 
 async function loadOverview() {
-  const o = await call("getOverview");
-  if (o) { State.projects = o.projects || []; State.claudeHome = o.home; }
+  const [o, g] = await Promise.all([call("getProviderOverview", State.agent), call("getProviderGlobalStats", State.agent)]);
+  if (o) { State.projects = o.projects || []; State.agentHome = o.home; State.claudeHome = o.claude_home || (State.agent === "claude" ? o.home : State.claudeHome); State.codexHome = o.codex_home || (State.agent === "codex" ? o.home : State.codexHome); }
   renderRail();
-  // Global aggregates power the Overview dashboard; refresh alongside.
-  const g = await call("getGlobalStats");
   if (g) { State.globalStats = g; if (State.view === "overview" && !State.projectId) renderDetail(); }
 }
 
 async function selectProject(id, { keepSession = false } = {}) {
   State.projectId = id;
-  if (!keepSession) { State.sessionId = null; State.detail = null; State.selectMode = false; clearSel(); }
+  if (!keepSession) {
+    if (State.view === "session" && backend && backend.leaveSession) backend.leaveSession();
+    State.sessionId = null; State.detail = null; State.transcript = null; State.selectMode = false; clearSel();
+  }
   State.view = State.view === "memory" ? "memory" : "project";
-  const r = await call("getSessions", id);
+  const p = State.projects.find((x) => x.id === id);
+  const provider = (p && p.provider) || (State.agent === "all" ? "claude" : State.agent);
+  const r = await call("getProviderSessions", provider, id);
   State.sessions = (r && r.sessions) || [];
   renderRail(); renderListPane(); renderDetail();
   if (State.view === "memory") loadMemory(id);
@@ -1464,9 +1591,15 @@ async function selectSession(sid) {
   State.view = "session";
   State.tab = "analytics"; // analytics-first
   document.getElementById("detail-pane").innerHTML = `<div class="detail-inner"><div class="skeleton">Loading session…</div></div>`;
-  const d = await call("getSessionDetail", State.projectId, sid);
+  const s = State.sessions.find((x) => x.session_id === sid) || {};
+  const provider = s.provider || currentProvider();
+  const d = await call("getProviderSessionDetail", provider, State.projectId, sid);
   State.detail = d || {};
   State.transcript = { events: d && d.events || [], start: d && d.events_start || 0, total: d && d.total_events || 0 };
+  if (State.transcript.events.length > MAX_BROWSER_TRANSCRIPT_EVENTS) {
+    const removed = State.transcript.events.length - MAX_BROWSER_TRANSCRIPT_EVENTS;
+    State.transcript.events.splice(0, removed); State.transcript.start += removed; State.transcript.trimmed = true;
+  }
   State._detailSig = detailSig(State.detail);
   renderListPane(); renderDetail();
 }
@@ -1478,9 +1611,11 @@ async function loadMemory(id) {
 }
 
 async function loadSettings() {
-  State.settings = await call("getSettings");
-  State.statuslineStatus = await call("statuslineStatus");
-  const cf = await call("listConfigFiles");
+  if (State.agent === "all") { State.settings = {}; State.configFiles = []; renderDetail(); return; }
+  State.settings = State.agent === "codex" ? await call("getCodexSettings") : await call("getSettings");
+  State.statuslineStatus = State.agent === "claude" ? await call("statuslineStatus") : null;
+  const project = currentProject();
+  const cf = State.agent === "codex" ? await call("listCodexConfigFiles", (project && project.path) || "") : await call("listConfigFiles");
   State.configFiles = (cf && cf.files) || [];
   renderDetail();
 }
@@ -1505,8 +1640,216 @@ async function openConfigFile(path) {
 async function saveConfigFile(path) {
   const ta = document.getElementById("cfg-textarea");
   if (!ta) return;
-  const r = await call("writeClaudeFile", path, ta.value);
+  const project = currentProject();
+  const r = State.agent === "codex"
+    ? await call("writeCodexFile", path, ta.value, (project && project.path) || "")
+    : await call("writeClaudeFile", path, ta.value);
   toast(r && r.ok ? "Saved " + path.split("/").pop() : "Save failed", r && r.ok ? "ok" : "err");
+}
+
+/* ---------- workbench commands, shortcuts, and accessibility ---------- */
+
+const SHORTCUTS = [
+  ["Command launcher", "Ctrl Shift P / Ctrl K"],
+  ["Quick open", "Ctrl P"],
+  ["Filter current list", "Ctrl F"],
+  ["Search all history", "Ctrl Shift F"],
+  ["Refresh data", "F5 / Ctrl R"],
+  ["New agent session", "Ctrl N"],
+  ["Resume selected session", "Ctrl Enter"],
+  ["Overview / Monitor / Cleanup / Instructions", "Ctrl 1…4"],
+  ["Settings", "Ctrl ,"],
+  ["Toggle project rail", "Ctrl B"],
+  ["Move between panes", "F6 / Shift F6"],
+  ["Cycle session tabs", "Ctrl Tab"],
+  ["Save open editor", "Ctrl S"],
+  ["Close or clear", "Esc"],
+  ["Shortcut reference", "?"],
+];
+
+function enhanceInteractive(root = document) {
+  if (!root) return;
+  root.querySelectorAll("[data-action]:not(button):not(input):not(select):not(textarea)").forEach((el) => {
+    if (!el.hasAttribute("tabindex")) el.tabIndex = 0;
+    if (!el.hasAttribute("role")) el.setAttribute("role", "button");
+  });
+  root.querySelectorAll(".tabs").forEach((el) => el.setAttribute("role", "tablist"));
+  root.querySelectorAll(".tab").forEach((el) => {
+    el.setAttribute("role", "tab");
+    el.setAttribute("aria-selected", el.classList.contains("active") ? "true" : "false");
+  });
+}
+
+function updateChrome() {
+  const scope = document.getElementById("status-scope");
+  const summary = document.getElementById("status-summary");
+  const project = projById(State.projectId);
+  if (scope) scope.textContent = `${agentInfo(State.agent).short} · ${project ? project.name : "All projects"}`;
+  if (summary) {
+    if (State.view === "session" && State.sessionId) {
+      const s = State.sessions.find((x) => x.session_id === State.sessionId) || {};
+      summary.textContent = `${s.active ? "recent activity · " : ""}${s.assistant_messages || 0} turns · ${fmt.tokens((s.usage || {}).total)} tokens${s.provider === "codex" ? "" : ` · ${fmt.cost(s.cost)} estimate`}`;
+    } else if (project) summary.textContent = `${State.sessions.length} sessions${project.provider === "codex" ? "" : ` · ${fmt.cost(project.total_cost)} estimate`}`;
+    else summary.textContent = `${State.projects.length} projects · ${(State.globalStats && State.globalStats.sessions) || 0} sessions indexed`;
+  }
+}
+
+function currentProject() {
+  return projById(State.projectId) || State.projects[0] || null;
+}
+
+async function launchClaudeSession(sessionId = "", path = "") {
+  const project = currentProject();
+  const cwd = path || (project && project.path) || "";
+  if (!cwd) return void toast("Choose a project with an available folder first", "err");
+  const provider = (State.sessions.find((x) => x.session_id === sessionId) || project || {}).provider || currentProvider();
+  const result = await call("launchAgent", provider, cwd, sessionId || "", "resume");
+  if (result && result.ok) {
+    const target = result.target === "desktop" ? " in the Codex desktop app" : (sessionId ? " in a terminal" : "");
+    toast(sessionId ? `${agentInfo(provider).short} session opened${target}` : `New ${agentInfo(provider).short} session opened${target}`, "ok");
+  }
+  else toast((result && result.error) || `Could not open ${agentInfo(provider).short}`, "err");
+}
+
+async function switchAgent(provider, nextView = "") {
+  if (!AGENTS[provider] || provider === State.agent) return;
+  if (backend && backend.leaveSession) backend.leaveSession();
+  State.agent = provider; localStorage.setItem("csm.agent", provider);
+  State.projectId = null; State.sessionId = null; State.sessions = []; State.detail = null; State.transcript = null;
+  State.settings = null; State.cleanup = null; State.tune = null; State.view = "overview"; clearSel();
+  if (!backend && State.previewProjects) {
+    State.projects = provider === "all" ? [...State.previewProjects] : State.previewProjects.filter((item) => item.provider === provider);
+  }
+  syncAgentSwitch(); renderListPane(); renderDetail(); await loadOverview(); renderDetail();
+  if (nextView) await navigateTo(nextView);
+}
+
+function syncAgentSwitch() {
+  document.querySelectorAll("[data-agent]").forEach((button) => {
+    if (!button.closest("#agent-switch")) return;
+    const active = button.dataset.agent === State.agent;
+    button.classList.toggle("active", active); button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  const footer = document.getElementById("live-label");
+  if (footer && footer.textContent !== "preview") footer.textContent = State.agent === "all" ? "both" : State.agent;
+}
+
+async function navigateTo(view) {
+  if (State.view === "session" && view !== "session") {
+    if (backend && backend.leaveSession) backend.leaveSession();
+    State.transcript = null;
+    State.detail = null;
+  }
+  State.view = view; State.projectId = null; State.sessionId = null;
+  State.selectMode = false; clearSel();
+  renderRail(); renderListPane();
+  if (view === "settings") await loadSettings();
+  else if (view === "monitor") await loadMonitor();
+  else if (view === "cleanup") await loadCleanup();
+  else if (view === "tune") await loadTune();
+  else if (view === "overview" && State.overviewDirty) { await loadOverview(); State.overviewDirty = false; }
+  else renderDetail();
+}
+
+function commandEntries(mode = "all") {
+  const project = currentProject();
+  const provider = (project && project.provider) || (State.agent === "all" ? "claude" : State.agent);
+  const entries = [
+    { glyph: "+", title: `New ${agentInfo(provider).label} session`, sub: project ? project.name : "Select a project", shortcut: "Ctrl N", run: () => launchClaudeSession() },
+    ...(State.sessionId ? [{ glyph: ">", title: "Resume selected session", sub: State.sessionId, shortcut: "Ctrl Enter", run: () => launchClaudeSession(State.sessionId) }] : []),
+    { glyph: "01", title: "Go to Overview", sub: "Navigation", shortcut: "Ctrl 1", run: () => navigateTo("overview") },
+    { glyph: "02", title: "Go to Monitor", sub: "Recent activity and runtime state", shortcut: "Ctrl 2", run: () => navigateTo("monitor") },
+    { glyph: "03", title: "Go to Cleanup", sub: "Storage management", shortcut: "Ctrl 3", run: () => navigateTo("cleanup") },
+    { glyph: "04", title: "Open agent instructions", sub: "CLAUDE.md or AGENTS.md", shortcut: "Ctrl 4", run: () => navigateTo("tune") },
+    { glyph: "S", title: "Open Settings", sub: `${agentInfo().label} configuration`, shortcut: "Ctrl ,", run: () => navigateTo("settings") },
+    { glyph: "A", title: "Show all agents", sub: "Claude Code and Codex", shortcut: "", run: () => switchAgent("all") },
+    { glyph: "C", title: "Show Claude Code", sub: "Filter the workbench", shortcut: "", run: () => switchAgent("claude") },
+    { glyph: "X", title: "Show Codex", sub: "Filter the workbench", shortcut: "", run: () => switchAgent("codex") },
+    { glyph: "R", title: "Refresh all data", sub: "Re-index changed sessions", shortcut: "F5", run: refreshAll },
+    { glyph: "?", title: "Show keyboard shortcuts", sub: "Reference", shortcut: "?", run: showShortcuts },
+    ...State.projects.map((p) => ({ glyph: "P", title: `Open project: ${p.name}`, sub: p.path || p.id, shortcut: "", run: () => selectProject(p.id) })),
+    ...State.sessions.slice(0, 100).map((s) => ({ glyph: "S", title: s.title || s.first_prompt || "Untitled session", sub: `Session · ${fmt.rel(s.mtime)}`, shortcut: "", run: () => selectSession(s.session_id) })),
+  ];
+  return mode === "open" ? entries.filter((x) => x.glyph === "P" || x.glyph === "S") : entries;
+}
+
+function renderCommandResults() {
+  const input = document.getElementById("command-input");
+  const q = (input && input.value || "").trim().toLowerCase();
+  const words = q.split(/\s+/).filter(Boolean);
+  const entries = commandEntries(State.paletteMode).filter((item) => {
+    const hay = `${item.title} ${item.sub || ""}`.toLowerCase();
+    return words.every((word) => hay.includes(word));
+  }).slice(0, 60);
+  State.paletteEntries = entries;
+  State.paletteIndex = Math.max(0, Math.min(State.paletteIndex, entries.length - 1));
+  const results = document.getElementById("command-results");
+  results.innerHTML = entries.length ? entries.map((item, i) => `<button class="command-row ${i === State.paletteIndex ? "active" : ""}" data-action="palette-run" data-index="${i}" role="option" aria-selected="${i === State.paletteIndex}">
+      <span class="command-glyph">${esc(item.glyph)}</span><span><span class="command-title">${esc(item.title)}</span><span class="command-sub">${esc(item.sub || "")}</span></span>${item.shortcut ? `<kbd>${esc(item.shortcut)}</kbd>` : ""}
+    </button>`).join("") : '<div class="command-empty">No matching commands</div>';
+  const active = results.querySelector(".active");
+  if (active) active.scrollIntoView({ block: "nearest" });
+}
+
+function openCommandPalette(mode = "all") {
+  State.paletteMode = mode; State.paletteIndex = 0; State.palettePreviousFocus = document.activeElement;
+  const back = document.getElementById("command-backdrop");
+  const input = document.getElementById("command-input");
+  back.hidden = false; input.value = "";
+  document.getElementById("palette-title").textContent = mode === "open" ? "Quick open" : "Command launcher";
+  renderCommandResults(); input.focus();
+}
+
+function closeCommandPalette() {
+  const back = document.getElementById("command-backdrop");
+  if (back.hidden) return false;
+  back.hidden = true;
+  if (State.palettePreviousFocus && State.palettePreviousFocus.focus) State.palettePreviousFocus.focus();
+  return true;
+}
+
+async function runPaletteEntry(index) {
+  const entry = (State.paletteEntries || [])[index];
+  if (!entry) return;
+  closeCommandPalette();
+  await entry.run();
+}
+
+function showShortcuts() {
+  closeCommandPalette();
+  const back = document.getElementById("shortcut-backdrop");
+  document.getElementById("shortcut-grid").innerHTML = SHORTCUTS.map(([label, key]) => `<div class="shortcut-row"><span>${esc(label)}</span><kbd>${esc(key)}</kbd></div>`).join("");
+  State.shortcutPreviousFocus = document.activeElement;
+  back.hidden = false;
+  back.querySelector("button").focus();
+}
+
+function closeShortcuts() {
+  const back = document.getElementById("shortcut-backdrop");
+  if (back.hidden) return false;
+  back.hidden = true;
+  if (State.shortcutPreviousFocus && State.shortcutPreviousFocus.focus) State.shortcutPreviousFocus.focus();
+  return true;
+}
+
+async function refreshAll() {
+  await loadOverview();
+  if (State.projectId) await selectProject(State.projectId, { keepSession: true });
+  toast("Data refreshed", "ok");
+}
+
+function focusSearch(global = false) {
+  const input = document.getElementById("search");
+  input.dataset.scope = global ? "global" : "filter";
+  input.placeholder = global ? "Search all sessions and prompts · Enter" : "Filter projects and sessions";
+  input.focus(); input.select();
+}
+
+function activateDialog(back) {
+  back.setAttribute("role", "dialog"); back.setAttribute("aria-modal", "true");
+  State.modalPreviousFocus = document.activeElement;
+  const focusables = back.querySelectorAll("button, input, textarea, select, [tabindex='0']");
+  if (focusables.length) focusables[0].focus();
 }
 
 /* ---------- event delegation ---------- */
@@ -1518,36 +1861,50 @@ document.addEventListener("click", async (ev) => {
   const path = t.dataset.path;
 
   switch (a) {
+    case "switch-agent": return void switchAgent(t.dataset.agent, t.dataset.next || "");
+    case "show-commands": return void openCommandPalette("all");
+    case "show-shortcuts": return void showShortcuts();
+    case "close-shortcuts": return void closeShortcuts();
+    case "palette-run": return void runPaletteEntry(Number(t.dataset.index));
+    case "focus-search": return void focusSearch(true);
+    case "launch-new": return void launchClaudeSession("", path || "");
+    case "launch-resume": return void launchClaudeSession(State.sessionId);
+    case "launch-fork": {
+      const p = currentProject();
+      const r = await call("launchAgent", "codex", (p && p.path) || "", State.sessionId || "", "fork");
+      toast(r && r.ok ? "Codex fork opened in a terminal" : ((r && r.error) || "Could not fork session"), r && r.ok ? "ok" : "err"); break;
+    }
     case "project": return void selectProject(t.dataset.id);
     case "session": return void selectSession(t.dataset.id);
     case "memory": { State.view = "memory"; renderListPane(); loadMemory(State.projectId); break; }
-    case "tab": { State.tab = t.dataset.tab; document.getElementById("tab-body").innerHTML = sessionTabBody(); document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === State.tab)); break; }
+    case "tab": { State.tab = t.dataset.tab; document.getElementById("tab-body").innerHTML = sessionTabBody(); document.querySelectorAll(".tab").forEach((x) => { const active = x.dataset.tab === State.tab; x.classList.toggle("active", active); x.setAttribute("aria-selected", active ? "true" : "false"); }); enhanceInteractive(document.getElementById("tab-body")); break; }
     case "toggle-noise": { State.showNoise = !State.showNoise; document.getElementById("tab-body").innerHTML = sessionTabBody(); break; }
     case "open-editor": { const r = await call("openInEditor", path); toast(r && r.ok ? "Opened in " + (r.editor || "editor") : "Could not open", r && r.ok ? "ok" : "err"); break; }
     case "open-folder": { await call("openPath", path); break; }
-    case "open-home": { await call("openPath", State.claudeHome); break; }
-    case "open-jsonl": { const p = `${State.claudeHome}/projects/${State.projectId}/${State.sessionId}.jsonl`; await call("openInEditor", p); break; }
+    case "open-home": { await call("openPath", State.agentHome || (State.agent === "codex" ? State.codexHome : State.claudeHome)); break; }
+    case "open-jsonl": { const p = State.detail && State.detail.path; if (p) await call("openInEditor", p); break; }
     case "refresh": { await loadOverview(); if (State.projectId) await selectProject(State.projectId, { keepSession: true }); toast("Refreshed", "ok"); break; }
     case "delete-session": return void confirmDeleteSession();
     case "toggle-select": { State.selectMode = !State.selectMode; clearSel(); renderListPane(); break; }
     case "session-toggle": {
       const s = State.sessions.find((x) => x.session_id === t.dataset.id);
       if (!s) break;
-      if (s.active) { toast("Live session — protected", "err"); break; }
-      toggleSel({ pid: State.projectId, sid: s.session_id, title: s.title, cost: s.cost, bytes: s.size_bytes || 0 });
+      if (s.active || s.protected) { toast("Recently active session — deletion is temporarily blocked", "err"); break; }
+      toggleSel({ provider: s.provider || currentProvider(), pid: State.projectId, sid: s.session_id, title: s.title, cost: s.cost, bytes: s.size_bytes || 0 });
       keepScroll("list-pane", renderListPane);
       break;
     }
     case "cleanup-row": {
-      const s = ((State.cleanup && State.cleanup.sessions) || []).find((x) => x.project_id === t.dataset.pid && x.session_id === t.dataset.sid);
+      const s = ((State.cleanup && State.cleanup.sessions) || []).find((x) => x.provider === t.dataset.provider && x.project_id === t.dataset.pid && x.session_id === t.dataset.sid);
       if (!s) break;
-      if (s.active) { toast("Live session — protected from cleanup", "err"); break; }
+      if (s.active || s.protected) { toast("Recently active session — deletion is temporarily blocked", "err"); break; }
       toggleSel(cleanupRec(s));
       keepScroll("detail-pane", renderDetail);
       break;
     }
     case "cleanup-preset": return void applyPreset(t.dataset.preset);
     case "cleanup-sort": { State.cleanupSort = t.dataset.sort; renderDetail(); break; }
+    case "cleanup-more": { State.cleanupLimit += 300; keepScroll("detail-pane", renderDetail); break; }
     case "tune-mode": {
       if (State.tune.busy || State.tune.mode === t.dataset.mode) break;
       syncTuneInstruction();
@@ -1561,6 +1918,13 @@ document.addEventListener("click", async (ev) => {
       await tuneRefreshGuidance(); renderDetail(); break;
     }
     case "tune-run": return void runTune();
+    case "tune-cancel": {
+      if (!State.tune || !State.tune.jobId) break;
+      const r = await call("cancelAssistant", State.tune.jobId);
+      State.tune.busy = false; State.tune.jobId = null;
+      State.tune.error = r && r.ok ? "Optimization cancelled." : ((r && r.error) || "Could not cancel job.");
+      renderDetail(); break;
+    }
     case "tune-save": return void saveTuneGuidance();
     case "tune-write-notes": return void writeTuneNotes();
     case "tune-note-toggle": {
@@ -1570,12 +1934,12 @@ document.addEventListener("click", async (ev) => {
     }
     case "sel-all": {
       if (State.view === "cleanup") {
-        ((State.cleanup && State.cleanup.sessions) || []).filter((s) => !s.active)
-          .forEach((s) => State.sel.set(selKey(s.project_id, s.session_id), cleanupRec(s)));
+        ((State.cleanup && State.cleanup.sessions) || []).filter((s) => !s.protected)
+          .forEach((s) => State.sel.set(selKey(s.project_id, s.session_id, s.provider), cleanupRec(s)));
         keepScroll("detail-pane", renderDetail);
       } else {
-        State.sessions.filter((s) => !s.active)
-          .forEach((s) => State.sel.set(selKey(State.projectId, s.session_id), { pid: State.projectId, sid: s.session_id, title: s.title, cost: s.cost, bytes: s.size_bytes || 0 }));
+        State.sessions.filter((s) => !s.protected)
+          .forEach((s) => State.sel.set(selKey(State.projectId, s.session_id, s.provider), { provider: s.provider || currentProvider(), pid: State.projectId, sid: s.session_id, title: s.title, cost: s.cost, bytes: s.size_bytes || 0 }));
         keepScroll("list-pane", renderListPane);
       }
       break;
@@ -1596,10 +1960,12 @@ document.addEventListener("click", async (ev) => {
     case "add-env": return void addCustomEnv();
     case "privacy-apply-all": return void applyPrivacyDefaults();
     case "open-settings-json": { await call("openInEditor", `${State.claudeHome}/settings.json`); break; }
+    case "goto-codex-settings": { State.view = "settings"; await loadSettings(); break; }
+    case "open-agents": { const f = (State.configFiles || []).find((x) => x.name === "AGENTS.md"); if (f) await call("openInEditor", f.path); else { State.view = "settings"; await loadSettings(); } break; }
     case "show-earlier": {
       const tr = State.transcript;
       if (!tr || tr.start <= 0) break;
-      const page = await call("getTranscriptBefore", State.projectId, State.sessionId, tr.start, 200);
+      const page = await call("getProviderTranscriptBefore", currentProvider(), State.projectId, State.sessionId, tr.start, 200);
       if (page && page.events) {
         tr.events = page.events.concat(tr.events);
         tr.start = page.start;
@@ -1608,9 +1974,20 @@ document.addEventListener("click", async (ev) => {
       break;
     }
     case "copy-resume": {
-      const cmd = `claude --resume ${State.sessionId}`;
+      const provider = currentProvider();
+      const cmd = provider === "codex" ? `codex resume ${State.sessionId}` : `claude --resume ${State.sessionId}`;
       try { await navigator.clipboard.writeText(cmd); toast("Copied: " + cmd, "ok"); }
       catch { const ta = document.createElement("textarea"); ta.value = cmd; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); toast("Copied: " + cmd, "ok"); }
+      break;
+    }
+    case "archive-session": {
+      return void confirmArchiveSession();
+    }
+    case "copy-compact": {
+      const cmd = "/compact Focus on the current objective, verified decisions, changed files, open risks, and the next concrete step.";
+      try { await navigator.clipboard.writeText(cmd); }
+      catch { const ta = document.createElement("textarea"); ta.value = cmd; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+      toast("Copied a focused /compact command", "ok");
       break;
     }
     case "goto-session": {
@@ -1635,6 +2012,7 @@ async function viewFileModal(path) {
       <button class="btn" data-m="open">Open externally</button>
       <button class="btn primary" data-m="cancel">Close</button></div></div>`;
   document.body.appendChild(back);
+  activateDialog(back);
   back.addEventListener("click", async (e) => {
     if (e.target === back || e.target.dataset.m === "cancel") back.remove();
     else if (e.target.dataset.m === "open") { await call("openInEditor", path); back.remove(); }
@@ -1672,31 +2050,29 @@ document.addEventListener("change", async (ev) => {
 });
 
 /* nav items */
-document.querySelectorAll(".nav-item").forEach((n) => n.addEventListener("click", () => {
-  const v = n.dataset.view;
-  State.view = v; State.projectId = null; State.sessionId = null; State.detail = null;
-  State.selectMode = false; clearSel();
-  document.querySelectorAll(".nav-item").forEach((x) => x.classList.toggle("active", x === n));
-  renderListPane();
-  if (v === "settings") loadSettings();
-  else if (v === "monitor") loadMonitor();
-  else if (v === "cleanup") loadCleanup();
-  else if (v === "tune") loadTune();
-  else renderDetail();
-}));
+document.querySelectorAll(".nav-item").forEach((n) => n.addEventListener("click", () => navigateTo(n.dataset.view)));
+document.getElementById("agent-switch").addEventListener("click", (ev) => {
+  const button = ev.target.closest("[data-agent]");
+  if (button) switchAgent(button.dataset.agent);
+});
 
 async function loadMonitor() {
   renderDetail();
+  if (State.agent !== "claude") return;
   const [settings, shells] = await Promise.all([call("getSettings"), call("getShells")]);
   State.settings = settings || State.settings;
   State.shells = shells || State.shells;
   renderDetail();
 }
 
-document.getElementById("refresh-btn").addEventListener("click", async () => {
-  await loadOverview();
-  if (State.projectId) await selectProject(State.projectId, { keepSession: true });
-});
+document.getElementById("refresh-btn").addEventListener("click", refreshAll);
+document.getElementById("command-trigger").addEventListener("click", () => openCommandPalette("all"));
+document.getElementById("help-trigger").addEventListener("click", showShortcuts);
+
+const commandInput = document.getElementById("command-input");
+commandInput.addEventListener("input", () => { State.paletteIndex = 0; renderCommandResults(); });
+document.getElementById("command-backdrop").addEventListener("click", (e) => { if (e.target.id === "command-backdrop") closeCommandPalette(); });
+document.getElementById("shortcut-backdrop").addEventListener("click", (e) => { if (e.target.id === "shortcut-backdrop") closeShortcuts(); });
 
 /* window controls — WSLg's native title bar is easy to miss */
 document.getElementById("win-min").addEventListener("click", () => backend && backend.windowMinimize());
@@ -1714,6 +2090,77 @@ document.getElementById("search").addEventListener("keydown", (e) => {
     e.target.value = ""; State.search = "";
     if (State.view === "search") { State.view = State.projectId ? "project" : "overview"; }
     renderRail(); renderListPane(); renderDetail();
+  }
+});
+
+document.addEventListener("keydown", async (e) => {
+  const paletteOpen = !document.getElementById("command-backdrop").hidden;
+  if (paletteOpen) {
+    if (e.key === "Escape") { e.preventDefault(); closeCommandPalette(); return; }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const n = (State.paletteEntries || []).length;
+      if (n) State.paletteIndex = (State.paletteIndex + (e.key === "ArrowDown" ? 1 : -1) + n) % n;
+      renderCommandResults(); return;
+    }
+    if (e.key === "Enter") { e.preventDefault(); await runPaletteEntry(State.paletteIndex); return; }
+  }
+
+  if (e.key === "Escape") {
+    if (closeShortcuts()) { e.preventDefault(); return; }
+    const modalBack = document.querySelector(".modal-back");
+    if (modalBack) { modalBack.remove(); e.preventDefault(); return; }
+  }
+
+  const target = e.target;
+  const editing = target && (target.matches("input, textarea, select") || target.isContentEditable);
+  const ctrl = e.ctrlKey || e.metaKey;
+
+  if ((ctrl && e.shiftKey && e.key.toLowerCase() === "p") || (ctrl && e.key.toLowerCase() === "k") || e.key === "F1") {
+    e.preventDefault(); openCommandPalette("all"); return;
+  }
+  if (ctrl && !e.shiftKey && e.key.toLowerCase() === "p") { e.preventDefault(); openCommandPalette("open"); return; }
+  if (ctrl && e.shiftKey && e.key.toLowerCase() === "f") { e.preventDefault(); focusSearch(true); return; }
+  if (ctrl && !e.shiftKey && e.key.toLowerCase() === "f") { e.preventDefault(); focusSearch(false); return; }
+  if (editing) {
+    if (ctrl && e.key.toLowerCase() === "s") {
+      const cfg = document.getElementById("cfg-textarea"), mem = document.getElementById("mem-textarea");
+      if (target === cfg && State._cfgFile) { e.preventDefault(); await saveConfigFile(State._cfgFile); }
+      else if (target === mem && State._memFile) { e.preventDefault(); await saveMemory(State._memFile); }
+    }
+    return;
+  }
+
+  if (e.key === "?" && !ctrl && !e.altKey) { e.preventDefault(); showShortcuts(); return; }
+  if (e.key === "/" && !ctrl && !e.altKey) { e.preventDefault(); focusSearch(false); return; }
+  if (e.key === "F5" || (ctrl && e.key.toLowerCase() === "r")) { e.preventDefault(); await refreshAll(); return; }
+  if (ctrl && e.key.toLowerCase() === "n") { e.preventDefault(); await launchClaudeSession(); return; }
+  if (ctrl && e.key === "Enter" && State.sessionId) { e.preventDefault(); await launchClaudeSession(State.sessionId); return; }
+  if (ctrl && e.key === ",") { e.preventDefault(); await navigateTo("settings"); return; }
+  if (ctrl && ["1", "2", "3", "4"].includes(e.key)) {
+    e.preventDefault(); await navigateTo(["overview", "monitor", "cleanup", "tune"][Number(e.key) - 1]); return;
+  }
+  if (ctrl && e.key.toLowerCase() === "b") {
+    e.preventDefault(); document.getElementById("app").classList.toggle("rail-collapsed");
+    localStorage.setItem("csm.railCollapsed", document.getElementById("app").classList.contains("rail-collapsed") ? "1" : "0"); return;
+  }
+  if (ctrl && e.key === "Tab" && State.view === "session") {
+    e.preventDefault();
+    const tabs = [...document.querySelectorAll(".tab")];
+    const i = tabs.findIndex((x) => x.dataset.tab === State.tab);
+    const next = tabs[(i + (e.shiftKey ? -1 : 1) + tabs.length) % tabs.length];
+    if (next) next.click(); return;
+  }
+  if (e.key === "F6") {
+    e.preventDefault();
+    const panes = [...document.querySelectorAll(".rail, .list-pane, .detail-pane")].filter((x) => getComputedStyle(x).display !== "none");
+    panes.forEach((x) => { if (!x.hasAttribute("tabindex")) x.tabIndex = -1; });
+    let i = panes.findIndex((x) => x === document.activeElement || x.contains(document.activeElement));
+    i = (i + (e.shiftKey ? -1 : 1) + panes.length) % panes.length;
+    if (panes[i]) panes[i].focus(); return;
+  }
+  if ((e.key === "Enter" || e.key === " ") && target && target.matches("[role='button'][data-action]")) {
+    e.preventDefault(); target.click();
   }
 });
 
@@ -1763,11 +2210,13 @@ function confirmDeleteSession() {
 
 function modal(title, body, onConfirm, extraHtml = "") {
   const back = document.createElement("div");
+  const confirmLabel = title.startsWith("Clean up") ? "Clean up" : (title.startsWith("Archive") ? "Archive" : "Delete");
   back.className = "modal-back";
   back.innerHTML = `<div class="modal"><h3>${esc(title)}</h3><p>${esc(body)}</p>${extraHtml}
     <div class="modal-actions"><button class="btn" data-m="cancel">Cancel</button>
-    <button class="btn primary danger" data-m="ok">Delete</button></div></div>`;
+    <button class="btn primary ${confirmLabel === "Delete" ? "danger" : ""}" data-m="ok">${confirmLabel}</button></div></div>`;
   document.body.appendChild(back);
+  activateDialog(back);
   back.addEventListener("click", (e) => {
     if (e.target === back || e.target.dataset.m === "cancel") back.remove();
     // Run the handler while the modal's own inputs (e.g. the purge checkbox)
@@ -1778,7 +2227,7 @@ function modal(title, body, onConfirm, extraHtml = "") {
 
 function toast(msg, kind = "") {
   let wrap = document.getElementById("toast-wrap");
-  if (!wrap) { wrap = document.createElement("div"); wrap.id = "toast-wrap"; document.body.appendChild(wrap); }
+  if (!wrap) { wrap = document.createElement("div"); wrap.id = "toast-wrap"; wrap.setAttribute("role", "status"); wrap.setAttribute("aria-live", "polite"); document.body.appendChild(wrap); }
   const el = document.createElement("div");
   el.className = "toast " + kind;
   el.textContent = msg;
@@ -1818,58 +2267,128 @@ function onDataChanged(reason) {
     return;
   }
 
+  const specific = String(reason || "").split(":");
+  if (specific[0] === "session" && specific[1] !== "claude" && specific[1] !== "codex") specific.splice(1, 0, "claude");
+  if (specific[0] === "session" && State.projectId &&
+      (specific[1] !== currentProvider() || specific[2] !== State.projectId || (State.sessionId && specific[3] !== State.sessionId))) {
+    State.overviewDirty = true;
+    return;
+  }
+
   clearTimeout(liveTimer);
-  liveTimer = setTimeout(async () => {
-    await loadOverview();
-    if (State.view === "project" && State.projectId) {
-      const r = await call("getSessions", State.projectId);
+  liveTimer = setTimeout(runLiveRefresh, 260);
+}
+
+function confirmArchiveSession() {
+  modal("Archive this Codex session?", "Codex will move it out of the active session list. The archive remains recoverable from Codex storage.", async () => {
+    const r = await call("archiveCodexSession", State.sessionId || "");
+    if (r && r.ok) {
+      toast("Codex session archived", "ok");
+      State.sessionId = null; State.detail = null; State.view = "project";
+      await loadOverview();
+      if (State.projectId) await selectProject(State.projectId);
+    } else toast((r && r.error) || "Archive failed", "err");
+  });
+}
+
+async function runLiveRefresh() {
+  if (State.liveRefreshInFlight) { State.liveRefreshQueued = true; return; }
+  State.liveRefreshInFlight = true;
+  try {
+    if (State.view === "overview" && !State.projectId) {
+      await loadOverview();
+      State.overviewDirty = false;
+      return;
+    }
+
+    if (State.projectId) {
+      const r = await call("getProviderSessions", currentProvider(), State.projectId);
       State.sessions = (r && r.sessions) || [];
       renderListPane();
-    } else if (State.view === "session" && State.sessionId) {
-      const r = await call("getSessions", State.projectId);
-      State.sessions = (r && r.sessions) || [];
-      const s = State.sessions.find((x) => x.session_id === State.sessionId);
-      if (s && s.active) {
-        const d = await call("getSessionDetail", State.projectId, State.sessionId);
-        // Skip the (expensive) re-render when nothing actually changed.
-        if (d && detailSig(d) !== State._detailSig) {
-          State._detailSig = detailSig(d);
-          State.detail = d;
-          const tr = State.transcript;
-          if (tr && tr.events.length) {
-            // Append only the newly written events; keep any earlier pages loaded.
-            const lastIdx = tr.start + tr.events.length - 1;
-            const page = await call("getTranscriptAfter", State.projectId, State.sessionId, lastIdx);
-            if (page && page.events && page.events.length) {
-              tr.events = tr.events.concat(page.events);
-              tr.total = page.total;
+    }
+
+    if (State.view === "session" && State.sessionId) {
+      const provider = currentProvider();
+      const d = await call("getProviderSessionDetail", provider, State.projectId, State.sessionId);
+      if (d && detailSig(d) !== State._detailSig) {
+        const pane = document.getElementById("detail-pane");
+        const oldTop = pane.scrollTop;
+        State._detailSig = detailSig(d);
+        State.detail = d;
+        const tr = State.transcript;
+        if (tr && tr.events.length) {
+          const lastIdx = tr.start + tr.events.length - 1;
+          const page = await call("getProviderTranscriptAfter", provider, State.projectId, State.sessionId, lastIdx);
+          if (page && page.events && page.events.length) {
+            tr.events = tr.events.concat(page.events);
+            tr.total = page.total;
+            if (tr.events.length > MAX_BROWSER_TRANSCRIPT_EVENTS) {
+              const removed = tr.events.length - MAX_BROWSER_TRANSCRIPT_EVENTS;
+              tr.events.splice(0, removed); tr.start += removed; tr.trimmed = true;
             }
-          } else {
-            State.transcript = { events: d.events || [], start: d.events_start || 0, total: d.total_events || 0 };
           }
-          renderDetail();
+        } else {
+          State.transcript = { events: d.events || [], start: d.events_start || 0, total: d.total_events || 0 };
         }
+        renderDetail();
+        pane.scrollTop = oldTop;
       }
-      renderListPane();
-    } else if (State.view === "monitor") {
+    } else if (State.view === "monitor" && State.agent === "claude") {
       State.shells = await call("getShells");
       renderDetail();
     }
-  }, 300);
+    // Aggregates can be expensive on a large archive. Mark them stale and
+    // refresh when Overview is next opened instead of rescanning every write.
+    State.overviewDirty = true;
+  } finally {
+    State.liveRefreshInFlight = false;
+    if (State.liveRefreshQueued) {
+      State.liveRefreshQueued = false;
+      clearTimeout(liveTimer); liveTimer = setTimeout(runLiveRefresh, 260);
+    }
+  }
 }
 
 /* ---------- boot ---------- */
 
 function boot() {
+  if (localStorage.getItem("csm.railCollapsed") === "1") document.getElementById("app").classList.add("rail-collapsed");
+  syncAgentSwitch();
+  if (typeof QWebChannel === "undefined" || !window.qt || !window.qt.webChannelTransport) {
+    bootPreview();
+    return;
+  }
   new QWebChannel(qt.webChannelTransport, async (channel) => {
     backend = channel.objects.backend;
     backend.dataChanged.connect(onDataChanged);
     backend.assistantEvent.connect(onAssistantEvent);
+    const info = await call("getAppInfo");
+    document.body.classList.toggle("custom-window-controls", !!(info && info.custom_window_controls));
     await loadOverview();
     renderListPane();
     renderDetail();
   });
 }
 
-if (window.qt && window.qt.webChannelTransport) boot();
-else window.addEventListener("load", boot);
+function bootPreview() {
+  document.getElementById("live-label").textContent = "preview";
+  document.getElementById("live-dot").title = "Static browser preview — launch the desktop app for live data";
+  State.agent = "all"; syncAgentSwitch();
+  State.projects = [
+    { provider: "claude", id: "preview-csm", name: "claudeSessionManager", path: "C:/workspace/claudeSessionManager", session_count: 18, active_count: 1, total_cost: 22.84, total_tokens: 4820000, last_activity: Date.now() / 1000, memory_count: 4 },
+    { provider: "codex", id: "preview-api", name: "platform-api", path: "C:/workspace/platform-api", session_count: 9, active_count: 0, total_cost: 0, total_tokens: 1930000, last_activity: Date.now() / 1000 - 7200, memory_count: 0 },
+    { provider: "claude", id: "preview-tools", name: "dev-tools", path: "C:/workspace/dev-tools", session_count: 6, active_count: 0, total_cost: 3.16, total_tokens: 740000, last_activity: Date.now() / 1000 - 86400, memory_count: 1 },
+  ];
+  State.previewProjects = [...State.projects];
+  State.globalStats = {
+    cost: 34.41, sessions: 33, active: 1, prompts: 214, turns: 782, tool_calls: 1264, subagent_sessions: 11,
+    usage: { total: 7490000, output: 398000, input: 104000, cache_read: 6120000, cache_write: 868000 },
+    by_model: { "claude-opus-4-8": { total: 4210000, cost: 23.9 }, "claude-sonnet-4-6": { total: 3280000, cost: 10.51 } },
+    tool_counts: { Read: 402, Edit: 238, Bash: 221, Search: 147, Agent: 41 },
+    sessions_by_day: Array.from({ length: 14 }, (_, i) => [`2026-07-${String(i + 8).padStart(2, "0")}`, [1, 3, 2, 4, 2, 5, 3][i % 7]]),
+  };
+  renderRail(); renderListPane(); renderDetail();
+}
+
+if (document.readyState === "loading") window.addEventListener("load", boot);
+else boot();
