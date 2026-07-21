@@ -32,6 +32,21 @@ class FrontendConventionTests(unittest.TestCase):
             "The bar fill is a span; without non-inline display its percentage width is ignored",
         )
 
+    def test_three_pane_detail_uses_container_responsiveness(self) -> None:
+        css = (Path(__file__).resolve().parents[1] / "web" / "styles.css").read_text("utf-8")
+        detail_rules = re.findall(r"\.detail-pane\s*\{([^}]+)\}", css)
+        self.assertTrue(
+            any(re.search(r"\bcontainer\s*:\s*detail\s*/\s*inline-size\s*;", rule) for rule in detail_rules),
+            "The detail view must respond to its pane width, not only the outer window width",
+        )
+        self.assertRegex(css, r"@container\s+detail\s*\(max-width:\s*520px\)")
+        self.assertRegex(css, r"@media\s*\(max-width:\s*860px\)")
+
+    def test_desktop_window_launch_size_is_screen_bounded(self) -> None:
+        app = (Path(__file__).resolve().parents[1] / "asm" / "app.py").read_text("utf-8")
+        self.assertIn("availableGeometry()", app)
+        self.assertNotIn("self.setMinimumSize(1040, 680)", app)
+
 
 if __name__ == "__main__":
     unittest.main()

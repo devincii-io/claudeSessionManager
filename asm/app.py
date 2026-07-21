@@ -100,8 +100,23 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1440, 920)
-        self.setMinimumSize(1040, 680)
+
+        # Keep the first window inside the current display's usable area. A
+        # fixed 1440px launch size can put the right side off-screen on small
+        # laptops, portrait displays, remote desktops, and high-DPI setups.
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen else None
+        self.setMinimumSize(760, 560)
+        if available is not None:
+            width = min(1440, max(760, int(available.width() * 0.94)))
+            height = min(920, max(560, int(available.height() * 0.92)))
+            self.resize(width, height)
+            self.move(
+                available.x() + max(0, (available.width() - width) // 2),
+                available.y() + max(0, (available.height() - height) // 2),
+            )
+        else:
+            self.resize(1280, 820)
 
         self._scanner = Scanner()
         self._watcher = Watcher()

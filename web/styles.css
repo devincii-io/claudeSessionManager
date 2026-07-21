@@ -65,6 +65,8 @@ body {
   background: linear-gradient(180deg, #211f1b, #1d1b18);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  min-width: 0;
+  overflow: hidden;
   -webkit-app-region: drag;
 }
 .brand { display: flex; align-items: center; gap: 9px; min-width: 210px; }
@@ -75,7 +77,7 @@ body {
 .brand-name { font-weight: 650; letter-spacing: -0.2px; font-size: 14px; }
 .brand-thin { color: var(--text-dim); font-weight: 400; }
 
-.search-wrap { flex: 1; display: flex; justify-content: center; -webkit-app-region: no-drag; }
+.search-wrap { flex: 1; min-width: 80px; display: flex; justify-content: center; -webkit-app-region: no-drag; }
 #search {
   width: 100%; max-width: 520px;
   background: #17150f; border: 1px solid var(--border);
@@ -102,7 +104,7 @@ body {
 .icon-btn.win-close:hover { border-color: var(--red); color: var(--red); }
 
 /* ---------- Body layout ---------- */
-.body { flex: 1; display: flex; min-height: 0; }
+.body { flex: 1; display: flex; min-width: 0; min-height: 0; }
 
 /* ---------- Rail ---------- */
 .rail {
@@ -167,8 +169,11 @@ body {
 .sc-badges { display: flex; gap: 5px; margin-top: 8px; flex-wrap: wrap; }
 
 /* ---------- Detail pane ---------- */
-.detail-pane { flex: 1; overflow-y: auto; background: var(--bg); min-width: 0; }
-.detail-inner { padding: 22px 26px; max-width: 1100px; }
+.detail-pane {
+  flex: 1; min-width: 0; overflow-y: auto; overflow-x: hidden; background: var(--bg);
+  container: detail / inline-size;
+}
+.detail-inner { width: 100%; min-width: 0; padding: 22px 26px; max-width: 1100px; }
 
 /* ---------- Generic ---------- */
 .badge {
@@ -369,8 +374,8 @@ pre.code { background: #17150f; border: 1px solid var(--border-soft); border-rad
 @keyframes slidein { from { transform: translateX(20px); opacity: 0; } }
 
 /* ---------- Modal ---------- */
-.modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center; z-index: 900; }
-.modal { background: var(--bg-2); border: 1px solid var(--border); border-radius: 12px; padding: 22px; width: 420px; box-shadow: var(--shadow); }
+.modal-back { position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center; z-index: 900; }
+.modal { background: var(--bg-2); border: 1px solid var(--border); border-radius: 12px; padding: 22px; width: min(420px, 100%); max-height: calc(100vh - 32px); overflow: auto; box-shadow: var(--shadow); }
 .modal h3 { font-size: 16px; margin-bottom: 8px; }
 .modal p { color: var(--text-dim); font-size: 13px; margin-bottom: 18px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
@@ -738,7 +743,19 @@ body.custom-window-controls .window-divider, body.custom-window-controls .window
 .shortcut-row { display: flex; align-items: center; justify-content: space-between; min-height: 34px; border-bottom: 1px solid var(--border-soft); color: var(--text-dim); }
 .dialog-foot { margin-top: 15px; color: var(--text-faint); font-size: 11px; }
 
-@media (max-width: 1180px) {
+/* Flex children must be allowed to contract before their contents overflow. */
+.topbar > *, .body > *, .page-head > :first-child, .health-main > :last-child,
+.update-copy, .file-row > :nth-child(2), .source-setting .s-main { min-width: 0; }
+.brand-name, .page-head h1, .page-head .ph-sub, .project-item .p-name,
+.list-head h2, .health-main p { overflow-wrap: anywhere; }
+.source-picker select { min-width: 0; text-overflow: ellipsis; }
+.statusbar > span, .statusbar > button { min-width: 0; }
+#status-scope, #status-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#status-summary { flex: 0 1 auto; }
+#toast-wrap { max-width: calc(100vw - 24px); right: 12px; bottom: 12px; }
+.toast { max-width: 100%; overflow-wrap: anywhere; }
+
+@media (max-width: 1280px) {
   .rail { width: 190px; }
   .brand { min-width: 170px; }
   .list-pane { width: 286px; }
@@ -746,14 +763,94 @@ body.custom-window-controls .window-divider, body.custom-window-controls .window
   .command-trigger > span { display: none; }
   .agent-switch button { padding: 0 7px; }
 }
-@media (max-width: 900px) {
+
+@media (max-width: 1080px) {
   .rail { width: 168px; }
-  .brand-name, .input-hint { display: none; }
+  .brand-name, .input-hint, .source-picker > span { display: none; }
   .brand { min-width: 48px; }
   #search { padding-right: 10px; }
-  .list-pane { width: 250px; }
+  .list-pane { width: 260px; }
   .detail-inner { padding: 16px; }
+  .source-picker select { max-width: 112px; }
+  .live-dot { margin: 0 2px; }
+}
+
+@media (max-width: 860px) {
+  .rail { width: 54px; padding-inline: 6px; }
+  .rail .nav-item { justify-content: center; padding-inline: 5px; }
+  .rail .nav-item > span:nth-child(2), .rail .nav-item kbd,
+  .rail-section-head, .rail .project-list, .rail-footer { display: none; }
+  .rail .nav-ic { width: 28px; }
+  .list-pane { width: 232px; }
   .agent-switch button[data-agent="all"] { display: none; }
+  #live-label { display: none; }
+  .live-dot { margin-inline: 1px; }
+  .statusbar { gap: 8px; }
+  #status-scope, .statusbar button[data-action="show-shortcuts"] { display: none; }
+}
+
+@media (max-width: 720px) {
+  .source-picker select { max-width: 92px; }
+  .list-pane { width: 218px; }
+  #help-trigger { display: none; }
+  .topbar-right { gap: 1px; }
+  .statusbar { padding-inline: 7px; }
+}
+
+@media (max-width: 520px) {
+  .palette-backdrop { padding: 12px; padding-top: 10vh; }
+  .palette, .shortcut-dialog { width: 100%; }
+  .shortcut-grid { grid-template-columns: 1fr; }
+  .dialog-head { gap: 12px; }
+  .modal-actions { flex-wrap: wrap; }
+  .modal-actions .btn { flex: 1 1 auto; justify-content: center; }
+}
+
+/* Detail content responds to the space left after the rail and session list,
+   not merely to the outer window width. This is what keeps three-pane views
+   usable while the window is resized. */
+@container detail (max-width: 720px) {
+  .detail-inner { padding: 16px 18px 26px; }
+  .quick-launch { grid-template-columns: 1fr 1fr; }
+  .health-panel { grid-template-columns: minmax(0, 1fr) auto; gap: 12px; }
+  .health-actions { grid-column: 1 / -1; }
+  .setting-grid { grid-template-columns: 1fr; }
+  .filter-grid { grid-template-columns: 1fr 1fr; }
+  .kv { grid-template-columns: minmax(100px, 160px) minmax(0, 1fr); }
+  .shortcut-grid { grid-template-columns: 1fr; }
+  .bar-row { grid-template-columns: minmax(80px, 105px) minmax(50px, 1fr) auto; gap: 8px; }
+}
+
+@container detail (max-width: 520px) {
+  .detail-inner { padding: 14px 14px 24px; }
+  .page-head, .update-row { flex-direction: column; align-items: stretch; gap: 10px; }
+  .page-actions, .update-actions, .health-actions { flex-wrap: wrap; }
+  .page-actions .btn, .update-actions .btn { flex: 1 1 auto; justify-content: center; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .quick-launch, .health-panel, .filter-grid, .kv { grid-template-columns: 1fr; }
+  .health-actions { grid-column: auto; }
+  .health-metrics, .donut-wrap { flex-wrap: wrap; }
+  .donut-wrap svg { max-width: 100%; height: auto; }
+  .setting-row, .source-setting { align-items: flex-start; flex-wrap: wrap; }
+  .setting-row .s-ctl { max-width: 100%; flex-wrap: wrap; }
+  .setting-row .s-ctl .s-input, .setting-row .s-ctl .select,
+  .setting-row .s-ctl .tune-select { max-width: 100%; }
+  .cleanup-tabs { overflow-x: auto; padding-bottom: 2px; }
+  .cleanup-tabs .chip { flex: 0 0 auto; }
+  .clean-row { align-items: flex-start; flex-wrap: wrap; }
+  .cr-nums { margin-left: 28px; flex-direction: row; align-items: center; }
+  .sel-bar { margin: 4px -14px -14px; padding: 11px 14px; flex-wrap: wrap; }
+  .sel-bar .sb-info { flex-basis: 100%; }
+  .file-meta { max-width: 34%; overflow: hidden; text-overflow: ellipsis; }
+}
+
+@container detail (max-width: 360px) {
+  .tiles { grid-template-columns: 1fr; }
+  .bar-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .bar-row .bar-track { grid-column: 1 / -1; grid-row: 2; }
+  .bar-row .bar-val { grid-column: 2; grid-row: 1; }
+  .page-actions .btn, .update-actions .btn { flex-basis: 100%; }
+  .section-title { align-items: flex-start; gap: 8px; flex-wrap: wrap; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
