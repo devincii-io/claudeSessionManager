@@ -55,6 +55,109 @@ const State = {
 
 const MAX_BROWSER_TRANSCRIPT_EVENTS = 1200;
 
+const PANE_SIZES = {
+  rail: { css: "--rail-width", storage: "asm.railWidth", default: 218, min: 160, max: 420 },
+  list: { css: "--list-width", storage: "asm.listWidth", default: 326, min: 240, max: 620 },
+};
+const MIN_DETAIL_WIDTH = 420;
+const paneCustomized = Object.fromEntries(
+  Object.entries(PANE_SIZES).map(([name, cfg]) => [name, localStorage.getItem(cfg.storage) !== null]),
+);
+
+function savedPaneWidth(name) {
+  const cfg = PANE_SIZES[name];
+  const value = Number(localStorage.getItem(cfg.storage));
+  return Number.isFinite(value) ? Math.max(cfg.min, Math.min(cfg.max, value)) : cfg.default;
+}
+
+function paneBounds(name) {
+  const cfg = PANE_SIZES[name];
+  const compactDesktop = window.innerWidth <= 1280;
+  const responsiveMin = compactDesktop ? (name === "rail" ? 168 : 240) : cfg.min;
+  const responsiveMax = compactDesktop ? (name === "rail" ? 190 : 286) : cfg.max;
+  const body = document.querySelector(".body");
+  const rail = document.querySelector(".rail");
+  const list = document.querySelector(".list-pane");
+  const otherWidth = name === "rail"
+    ? (list && getComputedStyle(list).display !== "none" ? list.getBoundingClientRect().width : 0)
+    : (rail && getComputedStyle(rail).display !== "none" ? rail.getBoundingClientRect().width : 0);
+  const available = body ? body.clientWidth - otherWidth - MIN_DETAIL_WIDTH - 12 : responsiveMax;
+  return { min: responsiveMin, max: Math.max(responsiveMin, Math.min(responsiveMax, available)) };
+}
+
+function setPaneWidth(name, value, persist = false) {
+  const cfg = PANE_SIZES[name];
+  const bounds = paneBounds(name);
+  const width = Math.round(Math.max(bounds.min, Math.min(bounds.max, Number(value) || cfg.default)));
+  document.documentElement.style.setProperty(cfg.css, `${width}px`);
+  const separator = document.querySelector(`.pane-resizer[data-pane="${name}"]`);
+  if (separator) {
+    separator.setAttribute("aria-valuemin", String(bounds.min));
+    separator.setAttribute("aria-valuemax", String(bounds.max));
+    separator.setAttribute("aria-valuenow", String(width));
+  }
+  if (persist) {
+    localStorage.setItem(cfg.storage, String(width));
+    paneCustomized[name] = true;
+  }
+  return width;
+}
+
+function resetPaneWidth(name) {
+  const cfg = PANE_SIZES[name];
+  localStorage.removeItem(cfg.storage);
+  paneCustomized[name] = false;
+  setPaneWidth(name, cfg.default);
+}
+
+function initPaneResizers() {
+  Object.keys(PANE_SIZES).forEach((name) => setPaneWidth(name, savedPaneWidth(name)));
+  document.querySelectorAll(".pane-resizer").forEach((separator) => {
+    const name = separator.dataset.pane;
+    let drag = null;
+    separator.addEventListener("mousedown", (event) => {
+      if (event.button !== 0 || window.innerWidth <= 1080) return;
+      const pane = document.querySelector(name === "rail" ? ".rail" : ".list-pane");
+      drag = { startX: event.clientX, startWidth: pane.getBoundingClientRect().width };
+      separator.dataset.active = "true";
+      document.body.classList.add("pane-resizing");
+      event.preventDefault();
+    });
+    window.addEventListener("mousemove", (event) => {
+      if (!drag) return;
+      setPaneWidth(name, drag.startWidth + event.clientX - drag.startX);
+    });
+    const finish = () => {
+      if (!drag) return;
+      const pane = document.querySelector(name === "rail" ? ".rail" : ".list-pane");
+      setPaneWidth(name, pane.getBoundingClientRect().width, true);
+      drag = null;
+      delete separator.dataset.active;
+      document.body.classList.remove("pane-resizing");
+    };
+    window.addEventListener("mouseup", finish);
+    window.addEventListener("blur", finish);
+    separator.addEventListener("dblclick", () => resetPaneWidth(name));
+    separator.addEventListener("keydown", (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key)) return;
+      event.preventDefault();
+      if (event.key === "Home") return resetPaneWidth(name);
+      const pane = document.querySelector(name === "rail" ? ".rail" : ".list-pane");
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      setPaneWidth(name, pane.getBoundingClientRect().width + direction * (event.shiftKey ? 32 : 12), true);
+    });
+  });
+  let resizeFrame = 0;
+  window.addEventListener("resize", () => {
+    cancelAnimationFrame(resizeFrame);
+    resizeFrame = requestAnimationFrame(() => {
+      Object.keys(PANE_SIZES).forEach((name) => {
+        setPaneWidth(name, paneCustomized[name] ? savedPaneWidth(name) : PANE_SIZES[name].default);
+      });
+    });
+  });
+}
+
 /* ---------- multiselect ---------- */
 
 function selKey(pid, sid, provider = State.agent, source = "") { return (source || String(pid).split("::", 1)[0] || State.source) + "␟" + provider + "␟" + pid + "␟" + sid; }
@@ -274,6 +377,7 @@ function sourceBadge(item) {
 
 function renderListPane() {
   const el = document.getElementById("list-pane");
+  const separator = document.getElementById("list-resizer");
   // The rail already lists projects — the middle pane only appears inside a
   // project (sessions + memory) so information is never shown twice.
   if (State.projectId) {
@@ -283,6 +387,7 @@ function renderListPane() {
     el.style.display = "none";
     el.innerHTML = "";
   }
+  if (separator) separator.hidden = !State.projectId;
   enhanceInteractive(el);
   updateChrome();
 }
@@ -342,7 +447,7 @@ function sessionCard(s) {
       ${s.provider === "codex" ? "" : `<span class="p-cost">${fmt.cost(s.cost)}</span>`}
       <span>${fmt.rel(s.updated || s.mtime)}</span>
     </div>
-    <div style="margin-top:8px">${meterRow("ctx", s.context_pct, s.context_pct + "%")}</div>
+    <div class="sc-context">${meterRow("ctx", s.context_pct, s.context_pct + "%")}</div>
     ${badges.length ? `<div class="sc-badges">${badges.join("")}</div>` : ""}
   </div>`;
 }
@@ -430,7 +535,7 @@ function overviewView() {
   const launchProvider = recent && recent.provider;
   const launchLabel = State.agent === "all" && launchProvider ? `New ${agentInfo(launchProvider).label} session` : `New ${info.label} session`;
 
-  return `<div class="detail-inner">
+  return `<div class="detail-inner overview-layout">
     <div class="page-head"><div><h1>Overview</h1><div class="ph-sub">Local ${esc(info.label)} projects and sessions, indexed in one developer workbench</div></div>
       <div class="page-actions">${State.agent === "all" ? '<button class="btn sm" data-action="switch-agent" data-agent="claude">Claude data</button><button class="btn sm" data-action="switch-agent" data-agent="codex">Codex data</button>' : `<button class="btn sm" data-action="open-home">Open ${esc(info.home)}</button>`}</div></div>
     <div class="quick-launch" aria-label="Quick launch">
@@ -464,7 +569,7 @@ function overviewView() {
         false, "Shell, edit, read, search, and agent tool invocations")}
       ${tile("Subagent sessions", g.subagent_sessions, "detected locally", false, "Best-effort count of sessions that spawned subagents")}
     </div>
-    ${costKnown ? `<div class="section"><div class="section-title">${State.agent === "all" ? "Claude estimate" : "API-price estimate"} by project</div>
+    ${costKnown ? `<div class="section overview-wide"><div class="section-title">${State.agent === "all" ? "Claude estimate" : "API-price estimate"} by project</div>
       ${desc("Estimated cost of every session, grouped by the project it ran in.")}
       <div class="card">${costBars.length ? barChart(costBars) : '<div class="faint">No data.</div>'}</div></div>` : ""}
     ${donutItems.length ? `<div class="section"><div class="section-title">Models — ${costKnown ? "tokens and Claude estimate" : "tokens"}</div>
@@ -2615,6 +2720,7 @@ async function runLiveRefresh() {
 /* ---------- boot ---------- */
 
 function boot() {
+  initPaneResizers();
   if (storedSetting("railCollapsed", "0") === "1") document.getElementById("app").classList.add("rail-collapsed");
   syncAgentSwitch();
   if (typeof QWebChannel === "undefined" || !window.qt || !window.qt.webChannelTransport) {

@@ -32,6 +32,8 @@
   --shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, system-ui, sans-serif;
+  --rail-width: 218px;
+  --list-width: 326px;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -108,7 +110,7 @@ body {
 
 /* ---------- Rail ---------- */
 .rail {
-  width: 244px; flex-shrink: 0;
+  width: var(--rail-width); flex-shrink: 0;
   background: #1c1a16;
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column;
@@ -145,7 +147,7 @@ body {
 
 /* ---------- List pane ---------- */
 .list-pane {
-  width: 344px; flex-shrink: 0;
+  width: var(--list-width); flex-shrink: 0;
   background: var(--bg-2);
   border-right: 1px solid var(--border);
   overflow-y: auto;
@@ -166,6 +168,7 @@ body {
 .session-card .sc-title { font-weight: 560; font-size: 12.8px; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .session-card .sc-meta { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 8px; font-size: 10.8px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .session-card .sc-meta b { color: var(--text-dim); font-weight: 500; }
+.sc-context { margin-top: 8px; }
 .sc-badges { display: flex; gap: 5px; margin-top: 8px; flex-wrap: wrap; }
 
 /* ---------- Detail pane ---------- */
@@ -173,7 +176,20 @@ body {
   flex: 1; min-width: 0; overflow-y: auto; overflow-x: hidden; background: var(--bg);
   container: detail / inline-size;
 }
-.detail-inner { width: 100%; min-width: 0; padding: 22px 26px; max-width: 1100px; }
+.detail-inner { width: 100%; min-width: 0; padding: 22px 26px; }
+
+.pane-resizer {
+  position: relative; z-index: 6; width: 6px; flex: 0 0 6px; margin-inline: -3px;
+  cursor: col-resize; touch-action: none; outline: none;
+}
+.pane-resizer::after {
+  content: ""; position: absolute; inset-block: 0; left: 2px; width: 2px;
+  background: transparent; transition: background-color .12s;
+}
+.pane-resizer:hover::after, .pane-resizer:focus-visible::after,
+body.pane-resizing .pane-resizer[data-active="true"]::after { background: var(--accent); }
+.pane-resizer[hidden], .rail-collapsed .rail-resizer { display: none; }
+body.pane-resizing, body.pane-resizing * { cursor: col-resize !important; user-select: none !important; }
 
 /* ---------- Generic ---------- */
 .badge {
@@ -572,7 +588,7 @@ body.custom-window-controls .window-divider, body.custom-window-controls .window
 
 .body { min-height: 0; }
 .rail {
-  width: 218px; padding: 8px 7px 0; background: #13161c;
+  width: var(--rail-width); padding: 8px 7px 0; background: #13161c;
   border-right-color: var(--border-soft); overflow: hidden;
 }
 .nav-group { gap: 1px; margin-bottom: 10px; }
@@ -608,7 +624,7 @@ body.custom-window-controls .window-divider, body.custom-window-controls .window
 .rail-command:hover { color: var(--text); background: var(--bg-hover); border-color: #465165; }
 .rail-collapsed .rail { display: none; }
 
-.list-pane { width: 326px; background: var(--bg-2); border-right-color: var(--border-soft); }
+.list-pane { width: var(--list-width); background: var(--bg-2); border-right-color: var(--border-soft); container: sessions / inline-size; }
 .list-head { padding: 11px 12px 8px; background: var(--bg-2); border-bottom-color: var(--border-soft); }
 .list-head h2 { font-size: 14px; }
 .list-body { padding: 5px; gap: 2px; }
@@ -619,10 +635,20 @@ body.custom-window-controls .window-divider, body.custom-window-controls .window
 .session-card.active { background: var(--bg-active); border-color: transparent; box-shadow: inset 2px 0 var(--accent); }
 .session-card .sc-meta { margin-top: 6px; font-family: var(--mono); }
 .session-card .p-cost { color: var(--text-dim); }
+.sc-context { margin-top: 6px; }
 .sc-badges { margin-top: 6px; }
 
+@container sessions (min-width: 460px) {
+  .session-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 14px; }
+  .session-card .sc-title, .session-card .sc-meta, .session-card .sc-context { grid-column: 1; }
+  .session-card .sc-badges {
+    grid-column: 2; grid-row: 1 / 4; align-content: flex-start; justify-content: flex-end;
+    max-width: 170px; margin-top: 0;
+  }
+}
+
 .detail-pane { background: var(--bg); }
-.detail-inner { max-width: 1220px; padding: 20px 24px 32px; }
+.detail-inner { max-width: none; padding: 20px 24px 32px; }
 .page-head { margin-bottom: 17px; }
 .page-head h1 { font-size: 19px; font-weight: 630; }
 .page-head .ph-sub { color: var(--text-faint); }
@@ -756,13 +782,23 @@ body.custom-window-controls .window-divider, body.custom-window-controls .window
 .toast { max-width: 100%; overflow-wrap: anywhere; }
 
 @media (max-width: 1280px) {
-  .rail { width: 190px; }
+  .rail { width: clamp(168px, var(--rail-width), 190px); }
   .brand { min-width: 170px; }
-  .list-pane { width: 286px; }
+  .list-pane { width: clamp(240px, var(--list-width), 286px); }
   .quick-launch { grid-template-columns: 1fr 1fr; }
   .command-trigger > span { display: none; }
   .agent-switch button { padding: 0 7px; }
 }
+.overview-layout {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 16px; align-content: start;
+}
+.overview-layout > .page-head,
+.overview-layout > .quick-launch,
+.overview-layout > .tiles,
+.overview-layout > .overview-wide { grid-column: 1 / -1; }
+.overview-layout > .section { min-width: 0; }
+#tab-body .transcript { max-width: 1400px; }
 
 @media (max-width: 1080px) {
   .rail { width: 168px; }
@@ -773,6 +809,7 @@ body.custom-window-controls .window-divider, body.custom-window-controls .window
   .detail-inner { padding: 16px; }
   .source-picker select { max-width: 112px; }
   .live-dot { margin: 0 2px; }
+  .pane-resizer { display: none; }
 }
 
 @media (max-width: 860px) {
@@ -809,6 +846,10 @@ body.custom-window-controls .window-divider, body.custom-window-controls .window
 /* Detail content responds to the space left after the rail and session list,
    not merely to the outer window width. This is what keeps three-pane views
    usable while the window is resized. */
+@container detail (max-width: 1400px) {
+  .overview-layout { grid-template-columns: 1fr; }
+}
+
 @container detail (max-width: 720px) {
   .detail-inner { padding: 16px 18px 26px; }
   .quick-launch { grid-template-columns: 1fr 1fr; }

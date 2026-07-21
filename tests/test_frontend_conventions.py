@@ -47,6 +47,21 @@ class FrontendConventionTests(unittest.TestCase):
         self.assertIn("availableGeometry()", app)
         self.assertNotIn("self.setMinimumSize(1040, 680)", app)
 
+    def test_fullscreen_content_and_panes_are_resizable(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        css = (root / "web" / "styles.css").read_text("utf-8")
+        html = (root / "web" / "index.html").read_text("utf-8")
+        js = (root / "web" / "app.js").read_text("utf-8")
+        self.assertRegex(css, r"\.detail-inner\s*\{[^}]*max-width\s*:\s*none\s*;")
+        self.assertIn("detail-inner overview-layout", js)
+        self.assertEqual(html.count('role="separator"'), 2)
+        self.assertIn("--rail-width", css)
+        self.assertIn("--list-width", css)
+        self.assertIn("function initPaneResizers()", js)
+        self.assertIn('storage: "asm.railWidth"', js)
+        self.assertIn('storage: "asm.listWidth"', js)
+        self.assertIn("MIN_DETAIL_WIDTH = 420", js)
+
 
 if __name__ == "__main__":
     unittest.main()
