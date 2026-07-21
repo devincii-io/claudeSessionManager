@@ -149,9 +149,9 @@ This avoids the multi-second extraction cost of a large Qt WebEngine one-file
 executable on every launch. Build its per-user installer with Inno Setup 6:
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=2.0.1 packaging\agent-session-manager.iss
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=2.0.2 packaging\agent-session-manager.iss
 Copy-Item README.md,LICENSE -Destination dist\AgentSessionManager
-Compress-Archive -Path dist\AgentSessionManager -DestinationPath dist\AgentSessionManager-v2.0.1-Windows-x64-portable.zip -Force
+Compress-Archive -Path dist\AgentSessionManager -DestinationPath dist\AgentSessionManager-v2.0.2-Windows-x64-portable.zip -Force
 ```
 
 On Linux the same spec produces a single portable `dist/AgentSessionManager`
@@ -161,7 +161,7 @@ cannot cross-compile, so run it on the target OS. From WSL or Linux, the guarded
 release helper builds in an isolated temporary environment:
 
 ```bash
-bash packaging/build-linux.sh 2.0.1
+bash packaging/build-linux.sh 2.0.2
 ```
 
 Before publishing, create `dist/SHA256SUMS.txt` with SHA-256 entries for every

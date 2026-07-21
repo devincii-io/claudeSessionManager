@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #error AppVersion must be supplied, for example: ISCC.exe /DAppVersion=2.0.1 packaging\agent-session-manager.iss
+  #error AppVersion must be supplied, for example: ISCC.exe /DAppVersion=2.0.2 packaging\agent-session-manager.iss
 #endif
 
 #define AppName "Agent Session Manager"

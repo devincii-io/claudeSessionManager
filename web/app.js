@@ -47,7 +47,7 @@ const State = {
   overviewDirty: false,
   liveRefreshInFlight: false,
   liveRefreshQueued: false,
-  appVersion: "2.0.1",
+  appVersion: "2.0.2",
   update: null,
   updateBusy: "",
   updateRequested: false,

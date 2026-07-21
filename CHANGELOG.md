@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.2] — 2026-07-21
+
+### Changed
+- Fullscreen dashboards now use the available detail pane; widescreen analytics
+  arrange related cards in balanced columns.
+- Project navigation and session-list panes can be resized by mouse or keyboard,
+  with widths remembered per machine.
+- Wide session cards place their context and badges alongside metadata for a
+  clearer scan path.
+
+### Fixed
+- Responsive pane bounds preserve a usable detail area while preventing
+  horizontal overflow on compact windows.
+
 ## [2.0.1] — 2026-07-21
 
 ### Fixed
