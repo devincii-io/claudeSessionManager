@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] — 2026-07-21
+
+### Fixed
+- Analytics bars now render their calculated percentage widths correctly.
+- The desktop window opens inside the current display's usable area instead of
+  extending off-screen on compact, remote, portrait, and high-DPI displays.
+- The top bar, three-pane workspace, analytics, filters, settings, dialogs, and
+  status bar now reflow cleanly as the window is resized.
+
 ## [2.0.0] — 2026-07-21
 
 ### Added
