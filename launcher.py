@@ -1,8 +1,8 @@
-"""PyInstaller entry point — imports csm as a package so relative imports work."""
+"""PyInstaller entry point — imports asm as a package so relative imports work."""
 
 import sys
 
-from csm.app import main
+from asm.app import main
 
 if __name__ == "__main__":
     sys.exit(main())

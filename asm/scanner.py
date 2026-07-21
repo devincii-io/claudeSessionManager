@@ -722,7 +722,9 @@ class Scanner:
         }
 
     def get_statusline_live(self) -> dict | None:
-        f = self.home / ".csm-statusline.json"
+        f = self.home / ".asm-statusline.json"
+        if not f.is_file():
+            f = self.home / ".csm-statusline.json"
         if not f.is_file():
             return None
         try:

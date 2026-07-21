@@ -152,6 +152,11 @@ def settings_files() -> list[Path]:
 
 def statusline_capture_file() -> Path:
     """Where the optional statusline hook writes the latest live payload."""
+    return claude_home() / ".asm-statusline.json"
+
+
+def legacy_statusline_capture_file() -> Path:
+    """Previous capture path, read only so the v2 rename does not break hooks."""
     return claude_home() / ".csm-statusline.json"
 
 
@@ -159,9 +164,9 @@ def cache_dir() -> Path:
     """Per-user cache directory for parsed-session summaries."""
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        d = base / "ClaudeSessionManager" / "cache"
+        d = base / "AgentSessionManager" / "cache"
     else:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-        d = base / "claude-session-manager"
+        d = base / "agent-session-manager"
     d.mkdir(parents=True, exist_ok=True)
     return d

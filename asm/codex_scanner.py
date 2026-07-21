@@ -1,6 +1,6 @@
 """Scanner for Codex's date-partitioned rollout archive.
 
-This backend is intentionally isolated from :mod:`csm.scanner`: callers can
+This backend is intentionally isolated from :mod:`asm.scanner`: callers can
 adopt it provider-by-provider without changing the stable Claude implementation.
 Public records use the same field names as the current frontend and always carry
 ``provider="codex"``.

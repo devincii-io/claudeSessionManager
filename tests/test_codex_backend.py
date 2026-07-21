@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from csm.codex_scanner import CodexScanner
-from csm.codex_session_parser import detail, summarize
+from asm.codex_scanner import CodexScanner
+from asm.codex_session_parser import detail, summarize
 
 
 def _record(timestamp: str, record_type: str, payload: dict) -> dict:

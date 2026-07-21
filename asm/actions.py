@@ -12,12 +12,16 @@ import shlex
 import shutil
 import subprocess
 import time
+import webbrowser
 from urllib.parse import quote
 from pathlib import Path
 
 from . import paths
 
-_STATUSLINE_MARKER = "# >>> claude-session-manager capture >>>"
+_STATUSLINE_MARKER = "# >>> agent-session-manager capture >>>"
+_STATUSLINE_END = "# <<< agent-session-manager capture <<<"
+_LEGACY_STATUSLINE_MARKER = "# >>> claude-session-manager capture >>>"
+_LEGACY_STATUSLINE_END = "# <<< claude-session-manager capture <<<"
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -38,7 +42,7 @@ def _backup_existing(path: Path) -> str | None:
     if not path.is_file():
         return None
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = path.with_name(f"{path.name}.csm-backup-{stamp}")
+    backup = path.with_name(f"{path.name}.asm-backup-{stamp}")
     shutil.copy2(path, backup)
     return str(backup)
 
@@ -209,6 +213,15 @@ def open_path(path: str) -> dict:
                 subprocess.Popen(["xdg-open", str(p)])
         return {"ok": True}
     except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def open_release_page() -> dict:
+    """Open only this application's pinned GitHub releases page."""
+    try:
+        opened = webbrowser.open("https://github.com/devincii-io/agent-session-manager/releases/latest")
+        return {"ok": bool(opened)}
+    except webbrowser.Error as exc:
         return {"ok": False, "error": str(exc)}
 
 
@@ -676,7 +689,8 @@ def statusline_capture_status() -> dict:
     script = _statusline_script_path(settings)
     installed = False
     if script and script.is_file():
-        installed = _STATUSLINE_MARKER in script.read_text("utf-8", errors="replace")
+        text = script.read_text("utf-8", errors="replace")
+        installed = _STATUSLINE_MARKER in text or _LEGACY_STATUSLINE_MARKER in text
     return {
         "script": str(script) if script else None,
         "installed": installed,
@@ -692,11 +706,14 @@ def install_statusline_capture() -> dict:
     text = script.read_text("utf-8", errors="replace")
     if _STATUSLINE_MARKER in text:
         return {"ok": True, "already": True}
+    # Replace the v1 Claude-branded block in place so existing users keep one
+    # capture hook and begin writing to the new canonical filename.
+    text = _strip_statusline_blocks(text)
     capture = paths.statusline_capture_file()
     snippet = (
         f'\n{_STATUSLINE_MARKER}\n'
         f'printf \'%s\' "$input" > "{capture}" 2>/dev/null\n'
-        f"# <<< claude-session-manager capture <<<\n"
+        f"{_STATUSLINE_END}\n"
     )
     # Insert right after the line that reads stdin into $input.
     lines = text.splitlines(keepends=True)
@@ -719,21 +736,26 @@ def uninstall_statusline_capture() -> dict:
     if not script or not script.is_file():
         return {"ok": False, "error": "no script"}
     text = script.read_text("utf-8", errors="replace")
-    if _STATUSLINE_MARKER not in text:
+    if _STATUSLINE_MARKER not in text and _LEGACY_STATUSLINE_MARKER not in text:
         return {"ok": True, "already": True}
+    script.write_text(_strip_statusline_blocks(text), "utf-8")
+    return {"ok": True, "removed": True}
+
+
+def _strip_statusline_blocks(text: str) -> str:
+    """Remove current or legacy managed capture blocks from a shell script."""
     lines = text.splitlines(keepends=True)
     out, skip = [], False
     for line in lines:
-        if _STATUSLINE_MARKER in line:
+        if _STATUSLINE_MARKER in line or _LEGACY_STATUSLINE_MARKER in line:
             skip = True
             continue
-        if "<<< claude-session-manager capture <<<" in line:
+        if _STATUSLINE_END in line or _LEGACY_STATUSLINE_END in line:
             skip = False
             continue
         if not skip:
             out.append(line)
-    script.write_text("".join(out), "utf-8")
-    return {"ok": True, "removed": True}
+    return "".join(out)
 
 
 def _load_settings() -> dict:

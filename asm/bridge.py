@@ -11,13 +11,15 @@ import json
 import os
 from pathlib import Path
 import platform
+import threading
 import time
 from collections import Counter
 from uuid import uuid4
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal, Slot
 
-from . import actions, assistant, paths
+from . import __version__, actions, assistant, paths
+from . import update as updater
 from .scanner import Scanner
 from .codex_scanner import CodexScanner
 from .sources import Source, discover_sources, refresh_sources, source_by_id
@@ -31,6 +33,7 @@ def _j(obj) -> str:
 class Bridge(QObject):
     dataChanged = Signal(str)      # emitted (debounced) when the filesystem changes
     assistantEvent = Signal(str)   # async result of a claude-CLI job (JSON)
+    updateEvent = Signal(str)      # async release check/download result (JSON)
 
     def __init__(self, scanner: Scanner, watcher: Watcher) -> None:
         super().__init__()
@@ -46,6 +49,7 @@ class Bridge(QObject):
         self._open_session: tuple[str, str, str, str] | None = None
         self._pending_reason: str | None = None
         self._jobs: dict[str, tuple[QProcess, str, QTimer]] = {}
+        self._update_busy = False
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -130,7 +134,7 @@ class Bridge(QObject):
 
     @staticmethod
     def _classify_path(path: str) -> str:
-        if path.endswith(".csm-statusline.json"):
+        if path.endswith((".asm-statusline.json", ".csm-statusline.json")):
             return "statusline"
         try:
             rel = Path(path).resolve().relative_to(paths.projects_dir().resolve())
@@ -192,9 +196,39 @@ class Bridge(QObject):
     @Slot(result=str)
     def getAppInfo(self) -> str:
         return _j({
+            "version": __version__,
             "platform": platform.system().lower(),
             "custom_window_controls": platform.system() == "Linux" and bool(os.environ.get("WSL_DISTRO_NAME")),
         })
+
+    @Slot(bool, result=str)
+    def checkForUpdate(self, force: bool) -> str:
+        return self._start_update_job("check", force)
+
+    @Slot(result=str)
+    def installUpdate(self) -> str:
+        return self._start_update_job("install", True)
+
+    @Slot(result=str)
+    def openReleasePage(self) -> str:
+        return _j(actions.open_release_page())
+
+    def _start_update_job(self, kind: str, force: bool) -> str:
+        if self._update_busy:
+            return _j({"ok": False, "error": "An update operation is already running"})
+        self._update_busy = True
+        threading.Thread(target=self._update_worker, args=(kind, force), daemon=True).start()
+        return _j({"ok": True, "started": True, "kind": kind})
+
+    def _update_worker(self, kind: str, force: bool) -> None:
+        try:
+            result = updater.download_and_run() if kind == "install" else updater.check(force=force)
+            payload = {"ok": True, "kind": kind, **result}
+        except Exception as exc:
+            payload = {"ok": False, "kind": kind, "error": str(exc)}
+        finally:
+            self._update_busy = False
+        self.updateEvent.emit(_j(payload))
 
     @Slot(str, result=str)
     def getSessions(self, project_id: str) -> str:

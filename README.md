@@ -102,6 +102,20 @@ Docs: [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 Buttons throughout open paths in **VS Code** or your file manager, and sessions /
 memory can be **deleted** (with confirmation).
 
+## Install
+
+On Windows, download `AgentSessionManager-v<version>-Setup.exe` from the
+[latest release](https://github.com/devincii-io/agent-session-manager/releases/latest).
+The per-user installer needs no administrator access, adds a Start Menu entry,
+offers an optional Desktop shortcut, supports in-place upgrades, and includes a
+normal uninstaller. The app checks the same release feed in the background and
+will only open an update after its exact installer filename and SHA-256 checksum
+have both been verified.
+
+For a no-install copy, download the Windows portable ZIP and keep its complete
+`AgentSessionManager` folder together. Linux remains a portable single-file
+executable. All release files can be verified against `SHA256SUMS.txt`.
+
 ## Where the data lives
 
 | Agent | What | Path |
@@ -118,29 +132,42 @@ memory can be **deleted** (with confirmation).
 
 ```bash
 uv sync
-uv run csm
+uv run asm
 ```
 
-or `uv run python -m csm.app`.
+or `uv run python -m asm.app`.
 
-## Build a standalone executable
+## Build distributable applications
 
 ```bash
 uv sync --extra build
-uv run pyinstaller --noconfirm ClaudeSessionManager.spec
+uv run pyinstaller --noconfirm AgentSessionManager.spec
 ```
 
-This produces a **single-file** `dist/ClaudeSessionManager` executable — no
-`_internal` folder beside it. The build keeps only English/German Qt locales,
-omits Tk/splash payloads, and bundles Linux compatibility files only on Linux.
-PyInstaller cannot
-cross-compile, so run the build on the OS you're targeting (on Windows via
-`powershell.exe` + a Windows `uv` when working from WSL).
+Windows produces `dist/AgentSessionManager/`, an on-disk application bundle.
+This avoids the multi-second extraction cost of a large Qt WebEngine one-file
+executable on every launch. Build its per-user installer with Inno Setup 6:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=2.0.0 packaging\agent-session-manager.iss
+Copy-Item README.md,LICENSE -Destination dist\AgentSessionManager
+Compress-Archive -Path dist\AgentSessionManager -DestinationPath dist\AgentSessionManager-v2.0.0-Windows-x64-portable.zip
+```
+
+On Linux the same spec produces a single portable `dist/AgentSessionManager`
+executable. The build keeps only English/German Qt locales, omits Tk/splash
+payloads and unused QML plugins, and bundles Linux compatibility files only on Linux. PyInstaller
+cannot cross-compile, so run it on the target OS.
+
+Before publishing, create `dist/SHA256SUMS.txt` with SHA-256 entries for every
+release artifact. Automatic installation deliberately requires the exact names
+`AgentSessionManager-v<version>-Setup.exe` and `SHA256SUMS.txt`; changing those
+names makes the app fall back to opening the release page.
 
 ## Architecture
 
 ```
-csm/
+asm/
   paths.py            cross-platform Claude and Codex path resolution
   pricing.py          model price table + cost math
   session_parser.py   streaming .jsonl parser (summary + detail)

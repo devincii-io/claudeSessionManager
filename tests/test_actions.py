@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from csm import actions
+from asm import actions
 
 
 class DeleteSafetyTests(unittest.TestCase):
@@ -75,6 +75,16 @@ class SafeWriteTests(unittest.TestCase):
             self.assertTrue(Path(saved["backup"]).is_file())
             self.assertFalse(refused["ok"])
             self.assertEqual(config.read_text("utf-8"), "model = 'new'\n")
+
+    def test_statusline_rename_removes_current_and_legacy_blocks(self) -> None:
+        text = (
+            "before\n"
+            "# >>> claude-session-manager capture >>>\nold\n# <<< claude-session-manager capture <<<\n"
+            "middle\n"
+            "# >>> agent-session-manager capture >>>\nnew\n# <<< agent-session-manager capture <<<\n"
+            "after\n"
+        )
+        self.assertEqual(actions._strip_statusline_blocks(text), "before\nmiddle\nafter\n")
 
     def test_invalid_codex_toml_does_not_replace_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

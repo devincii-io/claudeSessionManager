@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from csm.session_parser import iter_file_records, read_new_lines
+from asm.session_parser import iter_file_records, read_new_lines
 
 
 class IncrementalReaderTests(unittest.TestCase):

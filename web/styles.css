@@ -661,6 +661,12 @@ body.custom-window-controls .window-divider, body.custom-window-controls .window
 .statusbar .status-spacer { flex: 1; border: 0; }
 .statusbar button { border: 0; background: transparent; color: var(--text-faint); cursor: pointer; }
 .statusbar button:hover { color: var(--text); }
+.statusbar .update-pill { color: var(--accent); font-weight: 600; }
+.statusbar .update-pill[hidden] { display: none; }
+
+.update-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.update-copy { min-width: 0; }
+.update-actions { display: flex; gap: 7px; flex: 0 0 auto; }
 
 .quick-launch {
   display: grid; grid-template-columns: minmax(210px, 1.3fr) repeat(3, minmax(130px, .75fr));

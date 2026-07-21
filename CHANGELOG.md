@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] — 2026-07-21
+
+### Added
+- A per-user Windows installer with Start Menu integration, optional Desktop
+  shortcut, uninstall support, and in-place upgrades without administrator access.
+- A Windows portable ZIP distribution and checksum-verified in-app release updater.
+- The repository, Python distribution, module, CLI, executable, cache, and build
+  identities are now consistently named Agent Session Manager.
+
+### Changed
+- Windows now ships as an on-disk application bundle for much faster cold starts;
+  Linux retains the portable single-file build. Unused Qt QML plugin catalogs
+  are omitted from both packages.
+- The canonical repository is now `devincii-io/agent-session-manager`; browser
+  preferences and legacy statusline hooks migrate without losing user state.
+
 ## [1.2.0] — 2026-07-21
 
 ### Added

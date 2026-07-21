@@ -8,8 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from csm import sources
-from csm.scanner import Scanner
+from asm import sources
+from asm.scanner import Scanner
 
 
 class SourceDiscoveryTests(unittest.TestCase):

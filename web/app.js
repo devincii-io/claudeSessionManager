@@ -6,13 +6,21 @@
 "use strict";
 
 let backend = null;
+function storedSetting(name, fallback = null) {
+  const key = `asm.${name}`;
+  const current = localStorage.getItem(key);
+  if (current !== null) return current;
+  const legacy = localStorage.getItem(`csm.${name}`);
+  if (legacy !== null) localStorage.setItem(key, legacy);
+  return legacy !== null ? legacy : fallback;
+}
 function storedEnabledSources() {
-  try { const value = JSON.parse(localStorage.getItem("csm.enabledSources") || '["windows"]'); return Array.isArray(value) ? value : ["windows"]; }
+  try { const value = JSON.parse(storedSetting("enabledSources", '["windows"]')); return Array.isArray(value) ? value : ["windows"]; }
   catch { return ["windows"]; }
 }
 const State = {
-  agent: localStorage.getItem("csm.agent") || "all", // all | claude | codex
-  source: localStorage.getItem("csm.source") || "windows",
+  agent: storedSetting("agent", "all"), // all | claude | codex
+  source: storedSetting("source", "windows"),
   sources: [],
   enabledSources: new Set(storedEnabledSources()),
   projects: [],
@@ -39,6 +47,10 @@ const State = {
   overviewDirty: false,
   liveRefreshInFlight: false,
   liveRefreshQueued: false,
+  appVersion: "2.0.0",
+  update: null,
+  updateBusy: "",
+  updateRequested: false,
 };
 
 const MAX_BROWSER_TRANSCRIPT_EVENTS = 1200;
@@ -986,7 +998,42 @@ function codexSettingsView() {
     <div class="section"><div class="section-title">Agent capabilities</div><div class="card">
       <div class="setting-row"><div class="s-main"><div class="s-label">Sessions and transcripts</div><div class="s-desc">Best-effort local adapter; unknown future events are skipped safely.</div></div>${badge("available", "green")}</div>
       <div class="setting-row"><div class="s-main"><div class="s-label">Tasks, scratchpads, images, statusline</div><div class="s-desc">Claude-specific on-disk features are intentionally not fabricated for Codex.</div></div>${badge("Claude only")}</div>
-    </div></div></div>`;
+    </div></div>
+    ${updateSettingsSection()}
+  </div>`;
+}
+
+function updateSettingsSection() {
+  const u = State.update;
+  let title = "Automatic update checks";
+  let detail = "Checks the official GitHub release and verifies the Windows installer against SHA256SUMS.txt before opening it.";
+  let actions = `<button class="btn sm" data-action="check-update">Check now</button>`;
+  let status = badge(`v${State.appVersion}`);
+  if (State.updateBusy === "check") {
+    title = "Checking for updates...";
+    actions = `<button class="btn sm" disabled>Checking...</button>`;
+  } else if (State.updateBusy === "install") {
+    title = "Downloading and verifying installer...";
+    actions = `<button class="btn sm" disabled>Downloading...</button>`;
+  } else if (u && u.ok === false) {
+    title = "Update check failed";
+    detail = u.error || "GitHub could not be reached.";
+  } else if (u && u.update_available) {
+    title = `Version ${u.latest} is available`;
+    detail = u.installable ? "The release asset will be downloaded, checksum-verified, then opened for an in-place upgrade." : "This release has no compatible verified Windows installer. Open its release page for other downloads.";
+    status = badge("update", "accent");
+    actions = u.installable
+      ? `<button class="btn sm primary" data-action="install-update">Install update</button><button class="btn sm" data-action="open-release">Release notes</button>`
+      : `<button class="btn sm" data-action="open-release">Open release</button>`;
+  } else if (u && u.latest) {
+    title = "Agent Session Manager is up to date";
+    detail = `Installed ${State.appVersion} · latest ${u.latest}. Background checks are cached for six hours.`;
+    status = badge("up to date", "green");
+  }
+  return `<div id="updates" class="section"><div class="section-title">App updates</div><div class="card update-row">
+    <div class="update-copy"><div class="s-label">${esc(title)} ${status}</div><div class="s-desc">${esc(detail)}</div></div>
+    <div class="update-actions">${actions}</div>
+  </div></div>`;
 }
 
 function sourceSettingsSection() {
@@ -1000,9 +1047,9 @@ function sourceSettingsSection() {
 
 function settingsView() {
   const selectedSource = State.source === "all" ? null : State.sources.find((source) => source.id === State.source);
-  if (State.source === "all" || (selectedSource && selectedSource.kind === "wsl")) return `<div class="detail-inner"><div class="page-head"><div><h1>Environment settings</h1><div class="ph-sub">Choose which Windows and WSL stores participate in scans.</div></div></div>${sourceSettingsSection()}${emptyState("R", "Configuration is read-only here", "Select Windows to edit agent configuration. WSL session browsing, metrics, search, resume and Codex archive remain source-aware.")}</div>`;
+  if (State.source === "all" || (selectedSource && selectedSource.kind === "wsl")) return `<div class="detail-inner"><div class="page-head"><div><h1>Environment settings</h1><div class="ph-sub">Choose which Windows and WSL stores participate in scans.</div></div></div>${sourceSettingsSection()}${emptyState("R", "Configuration is read-only here", "Select Windows to edit agent configuration. WSL session browsing, metrics, search, resume and Codex archive remain source-aware.")}${updateSettingsSection()}</div>`;
   if (State.agent === "codex") return codexSettingsView();
-  if (State.agent === "all") return `<div class="detail-inner">${sourceSettingsSection()}${emptyState("S", "Choose an agent", "Settings are intentionally separate. Select Claude or Codex so configuration never crosses agent boundaries.")}<div class="quick-launch"><button class="quick-action" data-action="switch-agent" data-agent="claude" data-next="settings"><strong>Claude Code settings</strong><span>settings.json, privacy, statusline</span></button><button class="quick-action" data-action="switch-agent" data-agent="codex" data-next="settings"><strong>Codex settings</strong><span>config.toml and AGENTS.md</span></button></div></div>`;
+  if (State.agent === "all") return `<div class="detail-inner">${sourceSettingsSection()}${emptyState("S", "Choose an agent", "Settings are intentionally separate. Select Claude or Codex so configuration never crosses agent boundaries.")}<div class="quick-launch"><button class="quick-action" data-action="switch-agent" data-agent="claude" data-next="settings"><strong>Claude Code settings</strong><span>settings.json, privacy, statusline</span></button><button class="quick-action" data-action="switch-agent" data-agent="codex" data-next="settings"><strong>Codex settings</strong><span>config.toml and AGENTS.md</span></button></div>${updateSettingsSection()}</div>`;
   const s = State.settings;
   if (!s) return `<div class="detail-inner"><div class="skeleton">Loading settings…</div></div>`;
   const merged = s.merged || {};
@@ -1100,6 +1147,7 @@ function settingsView() {
           </div>`).join("") || '<div class="faint" style="font-size:12px">No config files.</div>'}</div>
         <div id="cfg-editor" style="margin-top:14px"></div>
       </div></div>
+    ${updateSettingsSection()}
   </div>`;
 }
 
@@ -1615,6 +1663,26 @@ function onAssistantEvent(json) {
   renderDetail();
 }
 
+function refreshUpdateUI() {
+  const pill = document.getElementById("update-pill");
+  if (!pill) return;
+  const available = !!(State.update && State.update.ok !== false && State.update.update_available);
+  pill.hidden = !available;
+  if (available) pill.textContent = `Update ${State.update.latest}`;
+}
+
+function onUpdateEvent(json) {
+  let res; try { res = typeof json === "string" ? JSON.parse(json) : json; } catch { return; }
+  if (!res) return;
+  State.updateBusy = "";
+  State.update = { ...(State.update || {}), ...res };
+  refreshUpdateUI();
+  if (State.view === "settings") renderDetail();
+  if (res.kind === "install" && res.ok && res.launched) toast("Verified installer opened", "ok");
+  else if (!res.ok && State.updateRequested) toast(res.error || "Update operation failed", "err");
+  State.updateRequested = false;
+}
+
 async function saveTuneGuidance() {
   const t = State.tune;
   const ta = document.getElementById("tune-proposal");
@@ -1671,8 +1739,8 @@ async function loadSources(refresh = false) {
 }
 
 function persistSources() {
-  localStorage.setItem("csm.enabledSources", JSON.stringify([...State.enabledSources]));
-  localStorage.setItem("csm.source", State.source);
+  localStorage.setItem("asm.enabledSources", JSON.stringify([...State.enabledSources]));
+  localStorage.setItem("asm.source", State.source);
 }
 
 function renderSourceSwitch() {
@@ -1853,7 +1921,7 @@ async function launchClaudeSession(sessionId = "", path = "") {
 async function switchAgent(provider, nextView = "") {
   if (!AGENTS[provider] || provider === State.agent) return;
   if (backend && backend.leaveSession) backend.leaveSession();
-  State.agent = provider; localStorage.setItem("csm.agent", provider);
+  State.agent = provider; localStorage.setItem("asm.agent", provider);
   State.projectId = null; State.sessionId = null; State.sessions = []; State.detail = null; State.transcript = null;
   State.settings = null; State.cleanup = null; State.tune = null; State.view = "overview"; clearSel();
   if (!backend && State.previewProjects) {
@@ -2006,6 +2074,20 @@ document.addEventListener("click", async (ev) => {
     case "sources-all-off": { State.sources.filter((source) => source.kind === "wsl").forEach((source) => State.enabledSources.delete(source.id)); if (State.source === "all" || String(State.source).startsWith("wsl:")) State.source = (State.sources.find((source) => source.kind === "local") || {}).id || "windows"; persistSources(); renderSourceSwitch(); await loadOverview(); renderDetail(); toast("WSL sources disabled", "ok"); break; }
     case "show-commands": return void openCommandPalette("all");
     case "show-shortcuts": return void showShortcuts();
+    case "goto-update": { await navigateTo("settings"); document.getElementById("updates")?.scrollIntoView({ block: "center" }); break; }
+    case "check-update": {
+      State.updateBusy = "check"; State.updateRequested = true; renderDetail();
+      const r = await call("checkForUpdate", true);
+      if (!r || !r.ok) { State.updateBusy = ""; State.updateRequested = false; State.update = { ok: false, error: (r && r.error) || "Could not start update check" }; renderDetail(); }
+      break;
+    }
+    case "install-update": {
+      State.updateBusy = "install"; State.updateRequested = true; renderDetail();
+      const r = await call("installUpdate");
+      if (!r || !r.ok) { State.updateBusy = ""; State.updateRequested = false; toast((r && r.error) || "Could not start update", "err"); renderDetail(); }
+      break;
+    }
+    case "open-release": { await call("openReleasePage"); break; }
     case "close-shortcuts": return void closeShortcuts();
     case "palette-run": return void runPaletteEntry(Number(t.dataset.index));
     case "focus-search": return void focusSearch(true);
@@ -2321,7 +2403,7 @@ document.addEventListener("keydown", async (e) => {
   }
   if (ctrl && e.key.toLowerCase() === "b") {
     e.preventDefault(); document.getElementById("app").classList.toggle("rail-collapsed");
-    localStorage.setItem("csm.railCollapsed", document.getElementById("app").classList.contains("rail-collapsed") ? "1" : "0"); return;
+    localStorage.setItem("asm.railCollapsed", document.getElementById("app").classList.contains("rail-collapsed") ? "1" : "0"); return;
   }
   if (ctrl && e.key === "Tab" && State.view === "session") {
     e.preventDefault();
@@ -2533,7 +2615,7 @@ async function runLiveRefresh() {
 /* ---------- boot ---------- */
 
 function boot() {
-  if (localStorage.getItem("csm.railCollapsed") === "1") document.getElementById("app").classList.add("rail-collapsed");
+  if (storedSetting("railCollapsed", "0") === "1") document.getElementById("app").classList.add("rail-collapsed");
   syncAgentSwitch();
   if (typeof QWebChannel === "undefined" || !window.qt || !window.qt.webChannelTransport) {
     bootPreview();
@@ -2543,8 +2625,14 @@ function boot() {
     backend = channel.objects.backend;
     backend.dataChanged.connect(onDataChanged);
     backend.assistantEvent.connect(onAssistantEvent);
+    backend.updateEvent.connect(onUpdateEvent);
     const info = await call("getAppInfo");
+    if (info && info.version) {
+      State.appVersion = info.version;
+      document.getElementById("app-version").textContent = `v${info.version}`;
+    }
     document.body.classList.toggle("custom-window-controls", !!(info && info.custom_window_controls));
+    call("checkForUpdate", false);
     await loadSources();
     await loadOverview();
     renderListPane();
@@ -2557,7 +2645,7 @@ function bootPreview() {
   document.getElementById("live-dot").title = "Static browser preview — launch the desktop app for live data";
   State.agent = "all"; syncAgentSwitch();
   State.projects = [
-    { provider: "claude", id: "preview-csm", name: "claudeSessionManager", path: "C:/workspace/claudeSessionManager", session_count: 18, active_count: 1, total_cost: 22.84, total_tokens: 4820000, last_activity: Date.now() / 1000, memory_count: 4 },
+    { provider: "claude", id: "preview-asm", name: "agent-session-manager", path: "C:/workspace/agent-session-manager", session_count: 18, active_count: 1, total_cost: 22.84, total_tokens: 4820000, last_activity: Date.now() / 1000, memory_count: 4 },
     { provider: "codex", id: "preview-api", name: "platform-api", path: "C:/workspace/platform-api", session_count: 9, active_count: 0, total_cost: 0, total_tokens: 1930000, last_activity: Date.now() / 1000 - 7200, memory_count: 0 },
     { provider: "claude", id: "preview-tools", name: "dev-tools", path: "C:/workspace/dev-tools", session_count: 6, active_count: 0, total_cost: 3.16, total_tokens: 740000, last_activity: Date.now() / 1000 - 86400, memory_count: 1 },
   ];

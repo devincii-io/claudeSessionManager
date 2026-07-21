@@ -1,11 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller build spec — single-file (onefile) build.
+"""PyInstaller build spec for the installed Windows app and portable Linux app.
 
-Produces one self-contained ``ClaudeSessionManager`` executable (no ``_internal``
-folder beside it). The build deliberately omits Tk/splash payloads and only
+Windows uses an on-disk directory so Qt WebEngine starts immediately without
+extracting hundreds of megabytes on every launch. Linux remains a single-file
+portable build. The build deliberately omits Tk/splash payloads and only
 bundles the Linux compatibility library on Linux.
 
-Build:  uv run pyinstaller --noconfirm ClaudeSessionManager.spec
+Build:  uv run pyinstaller --noconfirm AgentSessionManager.spec
         (PyInstaller cannot cross-compile — run this on the target OS.)
 """
 
@@ -29,7 +30,7 @@ a = Analysis(
     binaries=[],
     datas=[("web", "web")] + ([("vendor", "vendor")] if sys.platform.startswith("linux") else []),
     hiddenimports=[],
-    hookspath=[],
+    hookspath=["packaging/hooks"],
     hooksconfig={},
     runtime_hooks=[],
     excludes=EXCLUDES,
@@ -52,13 +53,16 @@ def _keep_locale(item):
 a.datas = [item for item in a.datas if _keep_locale(item)]
 pyz = PYZ(a.pure)
 
+ONEDIR = sys.platform == "win32"
+
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    [] if ONEDIR else a.binaries,
+    [] if ONEDIR else a.datas,
     [],
-    name="ClaudeSessionManager",
+    exclude_binaries=ONEDIR,
+    name="AgentSessionManager",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -75,3 +79,13 @@ exe = EXE(
     entitlements_file=None,
     icon="web/icons/app.ico",
 )
+
+if ONEDIR:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="AgentSessionManager",
+    )

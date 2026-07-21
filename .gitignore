@@ -3,16 +3,19 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv*/
 venv/
 .uv/
 
 # Build artifacts
 build/
+build-*/
 dist/
+dist-*/
 *.spec.bak
 
 # App cache
-.csm_cache/
+.asm_cache/
 *.log
 
 # OS

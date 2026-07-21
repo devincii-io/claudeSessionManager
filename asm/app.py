@@ -83,13 +83,13 @@ def asset_dir() -> Path:
     """Locate the bundled web frontend across dev / installed / frozen layouts."""
     here = Path(__file__).resolve().parent
     candidates = [
-        here / "web",  # installed package (csm/web)
+        here / "web",  # installed package (asm/web)
         here.parent / "web",  # dev checkout (repo/web)
     ]
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         candidates.insert(0, Path(meipass) / "web")
-        candidates.insert(1, Path(meipass) / "csm" / "web")
+        candidates.insert(1, Path(meipass) / "asm" / "web")
     for c in candidates:
         if (c / "index.html").is_file():
             return c
@@ -128,9 +128,9 @@ class MainWindow(QMainWindow):
 
     def _on_first_load(self, ok: bool) -> None:  # noqa: FBT001
         _close_splash()
-        # Headless self-check (set CSM_SELFTEST=1): confirm the WebEngine page
+        # Headless self-check (set ASM_SELFTEST=1): confirm the WebEngine page
         # actually rendered, then exit 0/1. Lets a packaged build be smoke-tested.
-        if os.environ.get("CSM_SELFTEST"):
+        if os.environ.get("ASM_SELFTEST"):
             if not ok:
                 print("SELFTEST: loadFinished(False)")
                 QCoreApplication.exit(1)
@@ -149,7 +149,7 @@ def main() -> int:
     QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    app.setOrganizationName("claude-session-manager")
+    app.setOrganizationName("agent-session-manager")
     app.setWindowIcon(app_icon())
 
     palette = app.palette()
