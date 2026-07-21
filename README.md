@@ -7,7 +7,8 @@
 > trademarks of OpenAI. The app indexes local agent session data.
 
 A fast desktop workbench for local **Claude Code and Codex** sessions. Switch
-between `All`, `Claude`, and `Codex`; browse projects and transcripts; inspect
+independently between agents (`All`, `Claude`, `Codex`) and environments
+(`Windows`, an enabled WSL distro, or `All enabled`); browse projects and transcripts; inspect
 tokens, context pressure, tools, compactions, and subagents; launch or resume
 work; search history; manage storage; and edit each agent's configuration without
 pretending their formats or capabilities are identical. Built with **PySide6** +
@@ -27,7 +28,8 @@ tail-following keeps a bounded browser window, and path-aware filesystem events
 refresh only the affected view instead of repeatedly rebuilding global analytics.
 Codex rollouts are grouped by canonical working directory, parsed lazily, and
 use cumulative token snapshots correctly; subagent rollouts do not inflate the
-top-level session count.
+top-level session count. WSL distro names are discovered cheaply and remain off
+by default; a distro is resolved and scanned only after you enable and select it.
 
 **Fast to drive:** `Ctrl+Shift+P` opens every command, `Ctrl+P` quick-opens a
 project/session, `Ctrl+F` filters, `Ctrl+Shift+F` searches all prompt history,
@@ -41,6 +43,9 @@ Docs: [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 
 - **Agent switcher** — `All | Claude | Codex` is a visible session-source filter,
   not a claim that an existing conversation can be converted between agents.
+- **Environment switcher** — Windows and each WSL distribution are independent
+  sources. Enable only the distros you want in Settings; `All enabled` aggregates
+  Claude and Codex metrics without slowing the default Windows-only refresh path.
 - **Projects** — every local project either agent has touched, ranked by recent
   activity with explicit agent badges.
 - **Sessions** — per-session transcript viewer (user / assistant / thinking / tool
@@ -56,12 +61,14 @@ Docs: [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
   files with frontmatter), with in-app **edit / save / delete**.
 - **Scratchpads** — the per-session scratchpad tree, with previews.
 - **Tasks** — the per-session task board.
-- **Cleanup** — manage every session on the machine with its full
-  on-disk footprint, multi-selected by hand or with one-tap presets (empty, small
-  talk, under 1¢, older than 30 days, largest 10) and deleted in bulk. Live
+- **Cleanup** — narrow sessions with real title/project/source, age, size, state,
+  turn, and asset filters, then explicitly select matching safe items. A separate
+  Assets & images view can remove uploads, legacy images, file history, tasks,
+  environments, and scratchpads without deleting transcripts. Live
   sessions active in the last 10 minutes are conservatively protected and the
   backend rechecks immediately before deletion. Claude transcripts can be
-  deleted; Codex sessions are archived through the supported Codex CLI command.
+  deleted; Codex sessions are archived through the supported Codex CLI command
+  and correctly report `0 B` reclaimed. WSL Claude cleanup is inspection-only.
 - **Instructions** — drive your own signed-in `claude` CLI over your history to **refine
   a CLAUDE.md** (global or per-project) or **consolidate sessions into memory
   notes**. Runs headless, async, cancellable, and backed up before writing; only
@@ -81,7 +88,7 @@ Docs: [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
   disk. An optional, removable one-line hook lets the app read the latest values.
 - **Global search** — press Enter in the search box to search every session
   (titles, first prompts) *and* your full prompt history, with jump-to-session.
-- **Image gallery** — pasted images from the session image cache, as thumbnails.
+- **Image gallery** — current Claude uploads and legacy image-cache files, as thumbnails.
 - **Workspace** — the per-session scratchpad *and* background-task outputs.
 - **Shells & environments** — shell snapshots and session-env dirs in Monitor.
 - **Settings as controls** — toggles and dropdowns writing straight to
@@ -89,7 +96,8 @@ Docs: [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
   (`statusline-command.sh`, `settings.json`, commands, agents…).
 - **Quick launch** — start/resume Claude or Codex with the exact provider-aware
   command. On Windows, documented `codex://` desktop deep links are used when the
-  Store CLI alias is unavailable; set `CODEX_CLI_PATH` for terminal launch.
+  Store CLI alias is unavailable; WSL launches execute inside the owning distro
+  with its raw Linux working directory. Set `CODEX_CLI_PATH` for native terminal launch.
 
 Buttons throughout open paths in **VS Code** or your file manager, and sessions /
 memory can be **deleted** (with confirmation).
@@ -104,6 +112,7 @@ memory can be **deleted** (with confirmation).
 | Codex | Data home | `~/.codex` or `$CODEX_HOME` |
 | Codex | Sessions | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` |
 | Codex | Settings / instructions | `$CODEX_HOME/config.toml`, `AGENTS.md` |
+| WSL | Per-distro agent homes | `\\wsl.localhost\<distro>\...\.claude`, `.codex` |
 
 ## Run
 
@@ -122,8 +131,9 @@ uv run pyinstaller --noconfirm ClaudeSessionManager.spec
 ```
 
 This produces a **single-file** `dist/ClaudeSessionManager` executable — no
-`_internal` folder beside it. On Windows it carries the app icon and shows a
-splash screen while it unpacks on first launch. PyInstaller cannot
+`_internal` folder beside it. The build keeps only English/German Qt locales,
+omits Tk/splash payloads, and bundles Linux compatibility files only on Linux.
+PyInstaller cannot
 cross-compile, so run the build on the OS you're targeting (on Windows via
 `powershell.exe` + a Windows `uv` when working from WSL).
 
@@ -136,6 +146,7 @@ csm/
   session_parser.py   streaming .jsonl parser (summary + detail)
   codex_session_parser.py  tolerant Codex rollout adapter
   codex_scanner.py    Codex project/session index and locator map
+  sources.py          lazy native/WSL source discovery and path context
   scanner.py          enumerate projects/sessions/memory/tasks/scratchpad/settings (cached)
   watcher.py          watchdog → Qt signals (live updates)
   actions.py          delete / bulk-delete / save / settings / statusline hook

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -125,6 +126,28 @@ class CodexParserTests(unittest.TestCase):
 
 
 class CodexScannerTests(unittest.TestCase):
+    def test_archived_threads_are_excluded_from_active_views(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / ".codex"
+            rollout = home / "sessions" / "2026" / "07" / "20" / "rollout-archived.jsonl"
+            _write_jsonl(rollout, [
+                _record("2026-07-20T10:00:00Z", "session_meta", {"id": "archived-id", "cwd": tmp, "source": "vscode"}),
+            ])
+            home.mkdir(parents=True, exist_ok=True)
+            db = sqlite3.connect(home / "state_5.sqlite")
+            try:
+                db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER, archived_at INTEGER)")
+                db.execute("INSERT INTO threads VALUES ('archived-id', 1, 123)")
+                db.commit()
+            finally:
+                db.close()
+            scanner = CodexScanner(home)
+            self.assertEqual(scanner.scan_projects(), [])
+            self.assertEqual(scanner.global_stats()["sessions"], 0)
+            record = scanner.all_sessions()["sessions"][0]
+            self.assertTrue(record["archived"])
+            self.assertTrue(record["archive_state_known"])
+
     def test_groups_roots_by_cwd_excludes_children_and_uses_index_title(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / ".codex"

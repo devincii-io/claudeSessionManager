@@ -85,6 +85,7 @@ def delete_session(project_id: str, session_id: str, purge: bool = False) -> dic
             paths.tasks_dir(session_id),
             paths.file_history_dir(session_id),
             paths.image_cache_dir(session_id),
+            home / "uploads" / session_id,
             home / "session-env" / session_id,
         ):
             if d.is_dir() and _under(d, home):
@@ -113,6 +114,31 @@ def delete_sessions(items: list, purge: bool = False) -> dict:
     return {"ok": deleted > 0, "deleted": deleted, "count": len(results), "results": results}
 
 
+def delete_inventory_path(path: str, allowed_paths: set[str]) -> dict:
+    """Delete one backend-inventoried asset group, never an arbitrary path."""
+    target = Path(path)
+    try:
+        resolved = str(target.resolve())
+        allowed = {str(Path(item).resolve()) for item in allowed_paths}
+    except OSError:
+        return {"ok": False, "error": "Invalid asset path"}
+    if resolved not in allowed:
+        return {"ok": False, "error": "Asset is no longer in the cleanup inventory"}
+    if not target.is_dir():
+        return {"ok": False, "error": "Asset group no longer exists"}
+    try:
+        newest = max(
+            (item.stat().st_mtime for item in target.rglob("*") if item.is_file()),
+            default=target.stat().st_mtime,
+        )
+        if time.time() - newest <= 600:
+            return {"ok": False, "error": "Asset group changed in the last 10 minutes"}
+        shutil.rmtree(target)
+        return {"ok": True, "removed": [str(target)]}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def delete_memory(path: str) -> dict:
     p = Path(path)
     if p.is_file() and _under(p, paths.projects_dir()) and p.suffix == ".md":
@@ -132,10 +158,20 @@ def save_memory(path: str, content: str) -> dict:
 
 def delete_scratchpad_file(path: str) -> dict:
     p = Path(path)
-    # Scratchpads live under a temp dir; only allow deletion inside a scratchpad tree.
-    if p.is_file() and "scratchpad" in p.parts:
-        p.unlink()
-        return {"ok": True, "removed": str(p)}
+    if not p.is_file():
+        return {"ok": False, "error": "refused"}
+    try:
+        resolved = p.resolve()
+        for root in paths.temp_roots():
+            try:
+                rel = resolved.relative_to(root.resolve())
+            except (OSError, ValueError):
+                continue
+            if len(rel.parts) >= 5 and rel.parts[0].startswith("claude-") and rel.parts[3] == "scratchpad":
+                p.unlink()
+                return {"ok": True, "removed": str(p)}
+    except OSError:
+        pass
     return {"ok": False, "error": "refused"}
 
 
@@ -279,6 +315,62 @@ def launch_claude(project_path: str, session_id: str = "") -> dict:
     return launch_session("claude", project_path, session_id)
 
 
+def launch_wsl_session(
+    distro: str,
+    provider: str,
+    linux_cwd: str,
+    session_id: str = "",
+    mode: str = "resume",
+) -> dict:
+    """Launch an agent inside an already-validated WSL distribution.
+
+    Arguments are passed as an argv array; neither distro, path nor session id
+    is interpolated through a shell.
+    """
+    if platform.system() != "Windows" or provider not in {"claude", "codex"}:
+        return {"ok": False, "error": "WSL launch is only available on Windows"}
+    if not distro or not linux_cwd.startswith("/"):
+        return {"ok": False, "error": "Invalid WSL source or project path"}
+    if session_id and not all(ch.isalnum() or ch in "-_" for ch in session_id):
+        return {"ok": False, "error": "Invalid session id"}
+    if provider == "claude":
+        if mode == "fork":
+            return {"ok": False, "error": "Fork is only available for Codex sessions"}
+        agent_args = ["claude", "--resume", session_id] if session_id else ["claude"]
+    else:
+        subcommand = "fork" if mode == "fork" else "resume"
+        agent_args = ["codex", subcommand, session_id] if session_id else ["codex"]
+    wsl_args = ["wsl.exe", "-d", distro, "--cd", linux_cwd, "--", *agent_args]
+    try:
+        terminal = shutil.which("wt.exe") or shutil.which("wt")
+        if terminal:
+            subprocess.Popen([terminal, "-w", "0", "new-tab", "--", *wsl_args])
+            target = "windows-terminal"
+        else:
+            subprocess.Popen(wsl_args, creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
+            target = "console"
+        return {"ok": True, "provider": provider, "mode": mode if session_id else "new", "target": target}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def archive_wsl_codex_session(distro: str, session_id: str) -> dict:
+    if platform.system() != "Windows" or not distro:
+        return {"ok": False, "error": "Invalid WSL source"}
+    if not session_id or not all(ch.isalnum() or ch in "-_" for ch in session_id):
+        return {"ok": False, "error": "Invalid session id"}
+    try:
+        result = subprocess.run(
+            ["wsl.exe", "-d", distro, "--", "codex", "archive", session_id],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": str(exc)}
+    if result.returncode:
+        return {"ok": False, "error": (result.stderr or result.stdout or "Codex archive failed").strip()[-1000:]}
+    return {"ok": True, "session_id": session_id, "archived": True}
+
+
 def archive_codex_session(session_id: str) -> dict:
     """Ask the Codex CLI to archive a session without mutating its indexes.
 
@@ -339,6 +431,14 @@ def write_codex_file(path: str, content: str, project_path: str = "") -> dict:
         return {"ok": False, "error": "Invalid path"}
     if resolved not in allowed_resolved:
         return {"ok": False, "error": "Refused: not an editable Codex config file"}
+    if resolved.name == "config.toml":
+        try:
+            import tomllib
+            tomllib.loads(content)
+        except ModuleNotFoundError:
+            pass  # Python 3.10: keep compatibility without adding a dependency.
+        except Exception as exc:
+            return {"ok": False, "error": f"Invalid config.toml: {exc}"}
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
         backup = _backup_existing(resolved)

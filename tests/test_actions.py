@@ -76,6 +76,15 @@ class SafeWriteTests(unittest.TestCase):
             self.assertFalse(refused["ok"])
             self.assertEqual(config.read_text("utf-8"), "model = 'new'\n")
 
+    def test_invalid_codex_toml_does_not_replace_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / ".codex"; home.mkdir()
+            config = home / "config.toml"; config.write_text("model = 'valid'\n", "utf-8")
+            with patch.object(actions.paths, "codex_home", return_value=home):
+                result = actions.write_codex_file(str(config), "model = [\n")
+            self.assertFalse(result["ok"])
+            self.assertEqual(config.read_text("utf-8"), "model = 'valid'\n")
+
 
 class LaunchValidationTests(unittest.TestCase):
     def test_missing_project_is_rejected_before_process_launch(self) -> None:
@@ -108,6 +117,33 @@ class LaunchValidationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["target"], "desktop")
         startfile.assert_called_once_with("codex://threads/abc-123")
+
+    def test_wsl_resume_keeps_distro_and_linux_path_as_argv(self) -> None:
+        with patch.object(actions.platform, "system", return_value="Windows"), \
+                patch.object(actions.shutil, "which", return_value=None), \
+                patch.object(actions.subprocess, "Popen") as popen:
+            result = actions.launch_wsl_session("Ubuntu Dev", "claude", "/home/dev/My Project", "abc-123")
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            popen.call_args.args[0],
+            ["wsl.exe", "-d", "Ubuntu Dev", "--cd", "/home/dev/My Project", "--", "claude", "--resume", "abc-123"],
+        )
+
+
+class AssetCleanupTests(unittest.TestCase):
+    def test_only_inventoried_old_directory_can_be_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            allowed = root / "uploads" / "old-session"
+            refused = root / "uploads" / "other-session"
+            allowed.mkdir(parents=True); refused.mkdir(parents=True)
+            payload = allowed / "image.png"; payload.write_bytes(b"data")
+            old = time.time() - 601
+            os.utime(payload, (old, old)); os.utime(allowed, (old, old))
+            blocked = actions.delete_inventory_path(str(refused), {str(allowed)})
+            result = actions.delete_inventory_path(str(allowed), {str(allowed)})
+        self.assertFalse(blocked["ok"])
+        self.assertTrue(result["ok"])
 
 
 if __name__ == "__main__":

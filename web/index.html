@@ -20,6 +20,10 @@
         <button type="button" data-agent="claude">Claude</button>
         <button type="button" data-agent="codex">Codex</button>
       </div>
+      <label class="source-picker" title="Environment to scan. WSL sources are opt-in for faster refreshes.">
+        <span>Environment</span>
+        <select id="source-switch" aria-label="Environment"><option value="windows">Windows</option></select>
+      </label>
       <div class="search-wrap">
         <span class="search-icon" aria-hidden="true">/</span>
         <input id="search" type="text" placeholder="Filter projects and sessions" aria-label="Filter projects and sessions" autocomplete="off" spellcheck="false" />
@@ -77,7 +81,7 @@
       <span id="status-summary">Loading session index...</span>
       <span class="status-spacer"></span>
       <button data-action="show-shortcuts">Keyboard shortcuts</button>
-      <span>v1.1.0</span>
+      <span>v1.2.0</span>
     </footer>
   </div>
 

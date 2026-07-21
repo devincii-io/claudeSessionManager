@@ -35,8 +35,19 @@ MAX_DETAIL_STATES = 2  # incremental transcript states kept in memory
 
 
 class Scanner:
-    def __init__(self) -> None:
-        self._cache_path = paths.cache_dir() / "summaries.json"
+    def __init__(
+        self,
+        home: Path | None = None,
+        *,
+        cache_namespace: str = "local",
+        temp_roots: list[Path] | None = None,
+    ) -> None:
+        self.home = Path(home) if home is not None else paths.claude_home()
+        self.projects_root = self.home / "projects"
+        self._temp_roots = list(temp_roots) if temp_roots is not None else paths.temp_roots()
+        safe_namespace = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in cache_namespace)
+        cache_name = "summaries.json" if cache_namespace == "local" else f"summaries-{safe_namespace}.json"
+        self._cache_path = paths.cache_dir() / cache_name
         self._cache: dict[str, dict] = {}
         self._cache_dirty = False
         # path -> {"builder": SummaryBuilder, "offset": int}
@@ -100,7 +111,7 @@ class Scanner:
     # -- projects & sessions ------------------------------------------------ #
 
     def scan_projects(self) -> list[dict]:
-        root = paths.projects_dir()
+        root = self.projects_root
         if not root.is_dir():
             return []
         now = time.time()
@@ -136,7 +147,7 @@ class Scanner:
         return projects
 
     def list_sessions(self, project_id: str) -> list[dict]:
-        pdir = paths.projects_dir() / project_id
+        pdir = self.projects_root / project_id
         if not pdir.is_dir():
             return []
         now = time.time()
@@ -155,7 +166,7 @@ class Scanner:
         first — powers the Cleanup helper and the "which sessions to include"
         picker. Built from cached summaries plus each session's on-disk footprint
         (transcript + ancillary tasks/history/image/env data)."""
-        root = paths.projects_dir()
+        root = self.projects_root
         now = time.time()
         out: list[dict] = []
         if root.is_dir():
@@ -166,7 +177,8 @@ class Scanner:
                 cwd = next((s.cwd for s in summaries if s.cwd), "")
                 pname = Path(cwd).name if cwd else pdir.name.lstrip("-").replace("-", "/")
                 for s in summaries:
-                    extra = self._session_footprint(s.session_id)
+                    assets = self._session_asset_bytes(s.session_id)
+                    extra = assets["total"]
                     out.append({
                         "project_id": pdir.name,
                         "project_name": pname or pdir.name,
@@ -181,6 +193,7 @@ class Scanner:
                         "tool_calls": s.tool_calls,
                         "size_bytes": s.size_bytes,
                         "extra_bytes": extra,
+                        "asset_bytes": assets,
                         "mtime": s.mtime,
                         "created": s.created,
                         "active": now - s.mtime <= ACTIVE_WINDOW_SECONDS,
@@ -191,7 +204,7 @@ class Scanner:
         self._save_cache()
         out.sort(key=lambda x: x["size_bytes"] + x["extra_bytes"], reverse=True)
         total_bytes = sum(x["size_bytes"] + x["extra_bytes"] for x in out)
-        return {"sessions": out, "home": str(paths.claude_home()), "total_bytes": total_bytes}
+        return {"sessions": out, "home": str(self.home), "total_bytes": total_bytes}
 
     def summaries_for(self, items: list) -> list[dict]:
         """Cached summary dicts for a list of ``{project_id, session_id}`` — the
@@ -202,7 +215,7 @@ class Scanner:
             sid = (it or {}).get("session_id")
             if not pid or not sid:
                 continue
-            f = paths.projects_dir() / pid / f"{sid}.jsonl"
+            f = self.projects_root / pid / f"{sid}.jsonl"
             if f.is_file():
                 out.append(self._summary(f).to_dict())
         return out
@@ -210,19 +223,125 @@ class Scanner:
     def _session_footprint(self, session_id: str) -> int:
         """Bytes of a session's ancillary data (tasks, file-history, image-cache,
         session-env) — the extra space a purge deletion reclaims."""
-        home = paths.claude_home()
-        total = 0
-        for d in (
-            paths.tasks_dir(session_id),
-            paths.file_history_dir(session_id),
-            paths.image_cache_dir(session_id),
-            home / "session-env" / session_id,
-        ):
-            total += _dir_size(d)
-        return total
+        return self._session_asset_bytes(session_id)["total"]
+
+    def _session_asset_bytes(self, session_id: str) -> dict:
+        """Per-category ancillary footprint for useful cleanup filtering."""
+        result = {
+            "tasks": _dir_size(self.home / "tasks" / session_id),
+            "file_history": _dir_size(self.home / "file-history" / session_id),
+            "images": sum(_dir_size(root / session_id) for root in self._image_roots()),
+            "session_env": _dir_size(self.home / "session-env" / session_id),
+        }
+        result["total"] = sum(result.values())
+        return result
+
+    def storage_assets(self) -> dict:
+        """Inventory removable Claude ancillary data without reading contents.
+
+        Asset groups are direct, path-guardable directories.  The UI can filter
+        images, task state, file checkpoints, environments, and scratchpads
+        independently of transcript deletion.  A group is marked orphaned when
+        no current transcript has the same session id.
+        """
+        # Build the transcript join without calling all_sessions(): that method
+        # measures every asset directory, and this inventory walks those same
+        # directories with richer stats. Avoiding the duplicate traversal is
+        # especially important over opt-in WSL UNC sources.
+        now = time.time()
+        by_session: dict[str, dict] = {}
+        if self.projects_root.is_dir():
+            for pdir in self.projects_root.iterdir():
+                if not pdir.is_dir():
+                    continue
+                summaries = [self._summary(path) for path in pdir.glob("*.jsonl")]
+                cwd = next((summary.cwd for summary in summaries if summary.cwd), "")
+                project_name = Path(cwd).name if cwd else pdir.name.lstrip("-").replace("-", "/")
+                for summary in summaries:
+                    by_session[summary.session_id] = {
+                        "project_id": pdir.name,
+                        "project_name": project_name or pdir.name,
+                        "title": summary.title or summary.first_prompt or "Untitled session",
+                        "protected": now - summary.mtime <= PROTECTED_WINDOW_SECONDS,
+                    }
+        items: list[dict] = []
+
+        def add(kind: str, path: Path, session_id: str) -> None:
+            size, count, mtime = _dir_stats(path)
+            if not size and not count:
+                return
+            session = by_session.get(session_id)
+            items.append({
+                "provider": "claude",
+                "kind": kind,
+                "path": str(path),
+                "session_id": session_id,
+                "project_id": session.get("project_id", "") if session else "",
+                "project_name": session.get("project_name", "Unknown session") if session else "Unknown session",
+                "title": session.get("title", "Orphaned session data") if session else "Orphaned session data",
+                "size_bytes": size,
+                "file_count": count,
+                "mtime": mtime,
+                "orphaned": session is None,
+                "protected": bool(
+                    (session and session.get("protected"))
+                    or (mtime and time.time() - mtime <= PROTECTED_WINDOW_SECONDS)
+                ),
+            })
+
+        categories = (
+            ("uploads", self.home / "uploads"),
+            ("legacy_images", self.home / "image-cache"),
+            ("file_history", self.home / "file-history"),
+            ("tasks", self.home / "tasks"),
+            ("session_env", self.home / "session-env"),
+        )
+        for kind, root in categories:
+            if not root.is_dir():
+                continue
+            try:
+                children = list(root.iterdir())
+            except OSError:
+                children = []
+            for child in children:
+                if child.is_dir():
+                    add(kind, child, child.name)
+
+        # Scratchpads live outside ~/.claude, below a generated claude-* tree.
+        # Only the exact */<session>/scratchpad leaf is surfaced.
+        seen: set[str] = set()
+        for temp_root in self._temp_roots:
+            for path in temp_root.glob("claude-*/*/*/scratchpad"):
+                try:
+                    key = str(path.resolve())
+                except OSError:
+                    continue
+                if key in seen or not path.is_dir():
+                    continue
+                seen.add(key)
+                add("scratchpad", path, path.parent.name)
+
+        items.sort(key=lambda item: item["size_bytes"], reverse=True)
+        by_kind: dict[str, dict] = {}
+        for item in items:
+            bucket = by_kind.setdefault(item["kind"], {"bytes": 0, "groups": 0, "files": 0})
+            bucket["bytes"] += item["size_bytes"]
+            bucket["groups"] += 1
+            bucket["files"] += item["file_count"]
+        return {
+            "provider": "claude",
+            "items": items,
+            "by_kind": by_kind,
+            "total_bytes": sum(item["size_bytes"] for item in items),
+            "orphaned_bytes": sum(item["size_bytes"] for item in items if item["orphaned"]),
+        }
+
+    def _image_roots(self) -> tuple[Path, Path]:
+        """Current uploads plus the legacy image-cache location."""
+        return (self.home / "uploads", self.home / "image-cache")
 
     def project_path(self, project_id: str) -> str:
-        pdir = paths.projects_dir() / project_id
+        pdir = self.projects_root / project_id
         for f in pdir.glob("*.jsonl"):
             s = self._summary(f)
             if s.cwd:
@@ -231,7 +350,7 @@ class Scanner:
 
     def release_detail(self, project_id: str, session_id: str) -> None:
         """Release a reconstructed transcript when its inspector is closed."""
-        key = str(paths.projects_dir() / project_id / f"{session_id}.jsonl")
+        key = str(self.projects_root / project_id / f"{session_id}.jsonl")
         self._detail_states.pop(key, None)
 
     # -- session detail (incremental, paged) --------------------------------- #
@@ -286,7 +405,7 @@ class Scanner:
     # -- memory ------------------------------------------------------------- #
 
     def get_memory(self, project_id: str) -> dict:
-        mem_dir = paths.projects_dir() / project_id / "memory"
+        mem_dir = self.projects_root / project_id / "memory"
         index = ""
         files: list[dict] = []
         if mem_dir.is_dir():
@@ -320,7 +439,7 @@ class Scanner:
     # -- tasks -------------------------------------------------------------- #
 
     def get_tasks(self, session_id: str) -> list[dict]:
-        tdir = paths.tasks_dir(session_id)
+        tdir = self.home / "tasks" / session_id
         if not tdir.is_dir():
             return []
         tasks: list[dict] = []
@@ -335,7 +454,15 @@ class Scanner:
     # -- workspace (scratchpad + background task outputs) ------------------- #
 
     def get_scratchpad(self, project_path: str, session_id: str) -> dict:
-        base = paths.session_tmp_dir(project_path, session_id)
+        base = None
+        encoded = paths.encode_project_path(project_path)
+        for root in self._temp_roots:
+            try:
+                base = next((p for p in root.glob(f"claude-*/{encoded}/{session_id}") if p.is_dir()), None)
+            except OSError:
+                base = None
+            if base:
+                break
         result = {"dir": str(base) if base else "", "exists": bool(base), "files": []}
         if not base:
             return result
@@ -363,24 +490,30 @@ class Scanner:
     # -- images ------------------------------------------------------------- #
 
     def get_images(self, session_id: str) -> list[dict]:
-        d = paths.image_cache_dir(session_id)
-        if not d.is_dir():
-            return []
         out = []
-        for f in sorted(d.iterdir()):
-            if f.suffix.lower() not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+        seen: set[str] = set()
+        for root in self._image_roots():
+            d = root / session_id
+            if not d.is_dir():
                 continue
-            try:
-                st = f.stat()
-            except OSError:
-                continue
-            out.append({"name": f.name, "path": str(f), "size": st.st_size, "mtime": st.st_mtime})
+            for f in sorted(d.iterdir()):
+                if f.suffix.lower() not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+                    continue
+                try:
+                    key = str(f.resolve())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    st = f.stat()
+                except OSError:
+                    continue
+                out.append({"name": f.name, "path": str(f), "size": st.st_size, "mtime": st.st_mtime, "kind": root.name})
         return out
 
     # -- file history ------------------------------------------------------- #
 
     def get_file_history(self, session_id: str) -> dict:
-        d = paths.file_history_dir(session_id)
+        d = self.home / "file-history" / session_id
         count = 0
         total = 0
         if d.is_dir():
@@ -396,9 +529,9 @@ class Scanner:
     # -- shells & environments (monitor) ------------------------------------ #
 
     def get_shells(self) -> dict:
-        home = paths.claude_home()
+        home = self.home
         snaps = []
-        sdir = paths.shell_snapshots_dir()
+        sdir = self.home / "shell-snapshots"
         if sdir.is_dir():
             for f in sdir.iterdir():
                 if not f.is_file():
@@ -429,7 +562,7 @@ class Scanner:
         """Aggregate analytics across every session on the machine.
 
         Reads only cached summaries (cheap after the first scan)."""
-        root = paths.projects_dir()
+        root = self.projects_root
         totals = pricing.Usage()
         by_model: dict[str, pricing.Usage] = {}
         tools: Counter[str] = Counter()
@@ -538,7 +671,7 @@ class Scanner:
 
     def _refresh_history_index(self) -> None:
         """Incrementally cache prompt history instead of rereading it per query."""
-        hist = paths.claude_home() / "history.jsonl"
+        hist = self.home / "history.jsonl"
         try:
             size = hist.stat().st_size
         except OSError:
@@ -564,7 +697,7 @@ class Scanner:
     def get_settings(self) -> dict:
         merged: dict = {}
         raw: list[dict] = []
-        for f in paths.settings_files():
+        for f in (self.home / "settings.json", self.home / "settings.local.json"):
             if f.is_file():
                 try:
                     data = json.loads(f.read_text("utf-8"))
@@ -583,13 +716,13 @@ class Scanner:
         return {
             "merged": merged,
             "files": raw,
-            "home": str(paths.claude_home()),
+            "home": str(self.home),
             "statusline_script": sl_script,
             "live": self.get_statusline_live(),
         }
 
     def get_statusline_live(self) -> dict | None:
-        f = paths.statusline_capture_file()
+        f = self.home / ".csm-statusline.json"
         if not f.is_file():
             return None
         try:
@@ -616,6 +749,31 @@ def _dir_size(d: Path) -> int:
     except OSError:
         pass
     return total
+
+
+def _dir_stats(d: Path) -> tuple[int, int, float]:
+    """Return ``(bytes, files, newest_mtime)`` without following symlinks."""
+    total = count = 0
+    newest = 0.0
+    try:
+        with os.scandir(d) as it:
+            for entry in it:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        stat = entry.stat(follow_symlinks=False)
+                        total += stat.st_size
+                        count += 1
+                        newest = max(newest, stat.st_mtime)
+                    elif entry.is_dir(follow_symlinks=False):
+                        child_total, child_count, child_mtime = _dir_stats(Path(entry.path))
+                        total += child_total
+                        count += child_count
+                        newest = max(newest, child_mtime)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return total, count, newest
 
 
 def _parse_frontmatter(text: str) -> dict:

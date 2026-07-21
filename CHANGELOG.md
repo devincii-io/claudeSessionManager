@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-07-21
+
+### Added
+- Independent environment switching for Windows, each opt-in WSL distribution,
+  and `All enabled`, orthogonal to the `All | Claude | Codex` agent switcher.
+- Lazy WSL discovery, per-distro Claude/Codex scanning, aggregate metrics, and
+  source-correct resume/new/fork/archive commands executed inside the distro.
+- Cleanup filters for search, age, size, state, turns, and asset category plus
+  an explicit `Select matching safe` action.
+- A separate asset cleanup inventory for current uploads, legacy images, file
+  history, tasks, session environments, scratchpads, and orphaned groups.
+
+### Changed
+- Windows remains the only enabled environment by default. Disabled WSL sources
+  incur no scan cost; all-source metrics include enabled sources only.
+- Cleanup now separates permanent Claude reclaim from Codex archive size and
+  reports Codex archive as `0 B` reclaimed.
+- The standalone build omits Tk/splash payloads, unused Qt locales, and Windows
+  copies of Linux-only compatibility files.
+
+### Fixed
+- Codex archived threads are read from its newest compatible state database in
+  read-only mode and no longer appear in active project/session views.
+- Current `~/.claude/uploads` images are indexed alongside legacy image-cache.
+- Recently written orphan assets are protected, scratchpad deletion is strictly
+  rooted, source IDs prevent Windows/WSL selection collisions, and truncated
+  config files can no longer be saved over their full originals.
+
 ## [1.1.0] — 2026-07-21
 
 ### Added

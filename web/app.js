@@ -6,8 +6,15 @@
 "use strict";
 
 let backend = null;
+function storedEnabledSources() {
+  try { const value = JSON.parse(localStorage.getItem("csm.enabledSources") || '["windows"]'); return Array.isArray(value) ? value : ["windows"]; }
+  catch { return ["windows"]; }
+}
 const State = {
   agent: localStorage.getItem("csm.agent") || "all", // all | claude | codex
+  source: localStorage.getItem("csm.source") || "windows",
+  sources: [],
+  enabledSources: new Set(storedEnabledSources()),
   projects: [],
   projectId: null,
   sessions: [],
@@ -23,6 +30,10 @@ const State = {
   cleanup: null,       // getAllSessions payload
   cleanupSort: "size", // size | age | cost
   cleanupLimit: 300,
+  cleanupMode: "sessions",
+  cleanupFilters: { query: "", age: 0, minSize: 0, maxTurns: -1, state: "active", asset: "" },
+  assets: null,
+  assetSel: new Map(),
   tune: null,          // Tune view state (see loadTune)
   paletteIndex: 0,
   overviewDirty: false,
@@ -34,10 +45,10 @@ const MAX_BROWSER_TRANSCRIPT_EVENTS = 1200;
 
 /* ---------- multiselect ---------- */
 
-function selKey(pid, sid, provider = State.agent) { return provider + "␟" + pid + "␟" + sid; }
-function isSel(pid, sid, provider = State.agent) { return State.sel.has(selKey(pid, sid, provider)); }
+function selKey(pid, sid, provider = State.agent, source = "") { return (source || String(pid).split("::", 1)[0] || State.source) + "␟" + provider + "␟" + pid + "␟" + sid; }
+function isSel(pid, sid, provider = State.agent, source = "") { return State.sel.has(selKey(pid, sid, provider, source)); }
 function toggleSel(rec) {
-  const k = selKey(rec.pid, rec.sid, rec.provider || State.agent);
+  const k = selKey(rec.pid, rec.sid, rec.provider || State.agent, rec.source_id);
   if (State.sel.has(k)) State.sel.delete(k); else State.sel.set(k, rec);
 }
 function clearSel() { State.sel.clear(); }
@@ -56,7 +67,12 @@ function selTotals() {
   return { count: State.sel.size, cost, bytes };
 }
 function selItems() {
-  return [...State.sel.values()].map((r) => ({ provider: r.provider || State.agent, project_id: r.pid, session_id: r.sid }));
+  return [...State.sel.values()].map((r) => ({ provider: r.provider || State.agent, source_id: r.source_id || String(r.pid).split("::", 1)[0], project_id: r.pid, session_id: r.sid }));
+}
+
+function sourceScope() {
+  const ids = State.source === "all" ? [...State.enabledSources] : [State.source];
+  return JSON.stringify(ids.length ? ids : ["windows"]);
 }
 
 /* ---------- backend plumbing ---------- */
@@ -209,7 +225,7 @@ function renderRail() {
     !q || p.name.toLowerCase().includes(q) || (p.path || "").toLowerCase().includes(q));
   document.getElementById("project-list").innerHTML = list.map((p) => `
     <div class="project-item ${p.id === State.projectId ? "active" : ""}" data-action="project" data-id="${esc(p.id)}">
-      <div class="p-name">${p.active_count ? '<span class="dot-active"></span>' : ""}${esc(p.name)} ${providerBadge(p.provider)}</div>
+      <div class="p-name">${p.active_count ? '<span class="dot-active"></span>' : ""}${esc(p.name)} ${providerBadge(p.provider)} ${sourceBadge(p)}</div>
       <div class="p-meta">
         <span>${p.session_count} sess</span>
         ${p.provider === "codex" ? "" : `<span class="p-cost">${fmt.cost(p.total_cost)}</span>`}
@@ -236,6 +252,10 @@ function currentProvider() {
 function providerBadge(provider) {
   if (!provider || (State.agent !== "all" && State.view !== "search")) return "";
   return badge(agentInfo(provider).short, `provider-badge ${provider}`);
+}
+function sourceBadge(item) {
+  if (!item || !item.source_label || (State.source !== "all" && State.enabledSources.size <= 1)) return "";
+  return badge(item.source_label, "source-badge");
 }
 
 /* ---------- list pane ---------- */
@@ -368,7 +388,7 @@ async function runGlobalSearch(q) {
   State.searchQuery = q;
   State.searchResults = null;
   renderListPane(); renderDetail();
-  State.searchResults = await call("searchProvider", State.agent, q);
+  State.searchResults = await call("searchProvider", State.agent, sourceScope(), q);
   renderDetail();
 }
 
@@ -523,7 +543,7 @@ function sessionView() {
         ${provider === "codex" ? '<button class="btn sm" data-action="launch-fork">Fork</button>' : ""}
         <button class="btn sm" data-action="copy-resume">Copy command</button>
         <button class="btn sm" data-action="open-jsonl">Open .jsonl</button>
-        ${s.protected ? '<button class="btn sm" disabled title="Cleanup unlocks after 10 minutes without transcript activity">Recently active</button>' : (provider === "codex" ? '<button class="btn sm" data-action="archive-session">Archive</button>' : '<button class="btn sm danger" data-action="delete-session">Delete</button>')}
+        ${s.protected ? '<button class="btn sm" disabled title="Cleanup unlocks after 10 minutes without transcript activity">Recently active</button>' : (provider === "codex" ? '<button class="btn sm" data-action="archive-session">Archive</button>' : (s.source_writable === false ? '<button class="btn sm" disabled title="WSL Claude cleanup is read-only">Read-only</button>' : '<button class="btn sm danger" data-action="delete-session">Delete</button>'))}
       </div>
     </div>
     <div class="tabs">${tabs.map(([k, l]) => `<button class="tab ${State.tab === k ? "active" : ""}" data-action="tab" data-tab="${k}">${l}</button>`).join("")}</div>
@@ -801,12 +821,12 @@ function memoryView() {
 function memoryEditor(path) {
   const f = (State.memory.files || []).find((x) => x.path === path);
   if (!f) return "";
+  const readonly = State.memory.source_writable === false;
   return `<div class="section"><div class="section-title">${esc(f.name)}
       <span style="display:flex;gap:6px">
-        <button class="btn sm primary" data-action="mem-save" data-path="${esc(path)}">Save</button>
-        <button class="btn sm danger" data-action="mem-delete" data-path="${esc(path)}">Delete</button>
+        ${readonly ? '<span class="badge">WSL read-only</span>' : `<button class="btn sm primary" data-action="mem-save" data-path="${esc(path)}">Save</button><button class="btn sm danger" data-action="mem-delete" data-path="${esc(path)}">Delete</button>`}
       </span></div>
-    <textarea class="editor" id="mem-textarea" spellcheck="false">${esc(f.content)}</textarea></div>`;
+    <textarea class="editor" id="mem-textarea" spellcheck="false" ${readonly ? "readonly" : ""}>${esc(f.content)}</textarea></div>`;
 }
 
 /* ---------- settings view (catalog-driven; only set keys are written) -------- */
@@ -956,6 +976,7 @@ function codexSettingsView() {
   return `<div class="detail-inner">
     <div class="page-head"><div><h1>Codex settings</h1><div class="ph-sub mono">${esc(s.home || State.agentHome || "$CODEX_HOME")}</div></div>
       <div class="page-actions"><button class="btn sm" data-action="open-folder" data-path="${esc(s.home || State.agentHome || "")}">Open Codex home</button></div></div>
+    ${sourceSettingsSection()}
     <div class="notice"><strong>Safe configuration surface.</strong> Edit only <span class="mono">config.toml</span> and <span class="mono">AGENTS.md</span> here. Credentials, SQLite state, encrypted reasoning, and sandbox secrets are never exposed.</div>
     <div class="section"><div class="section-title">Configuration and instructions</div>
       ${desc("Codex owns the TOML schema and session indexes. Existing files are backed up before this app writes them.")}
@@ -968,9 +989,20 @@ function codexSettingsView() {
     </div></div></div>`;
 }
 
+function sourceSettingsSection() {
+  return `<div class="section"><div class="section-title">Environments <span style="display:flex;gap:6px"><button class="btn sm" data-action="sources-all-on">Enable WSL</button><button class="btn sm" data-action="sources-all-off">Disable WSL</button><button class="btn sm" data-action="refresh-sources">Detect again</button></span></div>
+    ${desc("Windows is always on. WSL distributions are opt-in and only enabled sources are scanned or included in All enabled, keeping refreshes fast.")}
+    <div class="card source-settings">${State.sources.map((source) => `<div class="source-setting">
+      <div class="s-main"><div class="s-label">${esc(source.label)}</div><div class="s-desc">${source.kind === "local" ? "Native live scanning" : `${State.enabledSources.has(source.id) ? "Enabled · manual refresh" : "Off · no scan cost"} · Claude and Codex`}</div></div>
+      <label class="switch"><input type="checkbox" data-role="source-toggle" data-source="${esc(source.id)}" ${State.enabledSources.has(source.id) ? "checked" : ""} ${source.kind === "local" ? "disabled" : ""}><span class="track"><span class="thumb"></span></span></label>
+    </div>`).join("")}</div></div>`;
+}
+
 function settingsView() {
+  const selectedSource = State.source === "all" ? null : State.sources.find((source) => source.id === State.source);
+  if (State.source === "all" || (selectedSource && selectedSource.kind === "wsl")) return `<div class="detail-inner"><div class="page-head"><div><h1>Environment settings</h1><div class="ph-sub">Choose which Windows and WSL stores participate in scans.</div></div></div>${sourceSettingsSection()}${emptyState("R", "Configuration is read-only here", "Select Windows to edit agent configuration. WSL session browsing, metrics, search, resume and Codex archive remain source-aware.")}</div>`;
   if (State.agent === "codex") return codexSettingsView();
-  if (State.agent === "all") return `<div class="detail-inner">${emptyState("S", "Choose an agent", "Settings are intentionally separate. Select Claude or Codex so configuration never crosses agent boundaries.")}<div class="quick-launch"><button class="quick-action" data-action="switch-agent" data-agent="claude" data-next="settings"><strong>Claude Code settings</strong><span>settings.json, privacy, statusline</span></button><button class="quick-action" data-action="switch-agent" data-agent="codex" data-next="settings"><strong>Codex settings</strong><span>config.toml and AGENTS.md</span></button></div></div>`;
+  if (State.agent === "all") return `<div class="detail-inner">${sourceSettingsSection()}${emptyState("S", "Choose an agent", "Settings are intentionally separate. Select Claude or Codex so configuration never crosses agent boundaries.")}<div class="quick-launch"><button class="quick-action" data-action="switch-agent" data-agent="claude" data-next="settings"><strong>Claude Code settings</strong><span>settings.json, privacy, statusline</span></button><button class="quick-action" data-action="switch-agent" data-agent="codex" data-next="settings"><strong>Codex settings</strong><span>config.toml and AGENTS.md</span></button></div></div>`;
   const s = State.settings;
   if (!s) return `<div class="detail-inner"><div class="skeleton">Loading settings…</div></div>`;
   const merged = s.merged || {};
@@ -999,6 +1031,8 @@ function settingsView() {
     <div class="page-head"><div><h1>Settings</h1><div class="ph-sub mono">${esc(s.home)}/settings.json</div></div>
       <div class="page-actions"><button class="btn sm" data-action="open-settings-json">Open settings.json</button>
         <button class="btn sm" data-action="open-folder" data-path="${esc(s.home)}">Open folder</button></div></div>
+
+    ${sourceSettingsSection()}
 
     <div class="section"><div class="section-title">Privacy &amp; data
       <button class="btn sm ${allPrivOn ? "" : "primary"}" data-action="privacy-apply-all" ${allPrivOn ? "disabled" : ""}>${allPrivOn ? "All protections on" : "Apply privacy-first defaults"}</button></div>
@@ -1185,16 +1219,8 @@ function monitorView() {
 
 /* ---------- cleanup / deletion helper ---------- */
 
-const PRESETS = [
-  ["empty", "Empty", "Sessions with 0 assistant replies — usually opened by mistake"],
-  ["small", "Small talk", "≤ 2 assistant replies — quick throwaway chats"],
-  ["cheap", "Under 1¢", "Cost below $0.01 — negligible sessions"],
-  ["old", "Older than 30d", "Not touched in the last 30 days"],
-  ["large10", "Largest 10", "The 10 biggest sessions on disk"],
-];
-
 function cleanupRec(s) {
-  return { provider: s.provider || State.agent, pid: s.project_id, sid: s.session_id, title: s.title, cost: s.cost, bytes: (s.size_bytes || 0) + (s.extra_bytes || 0) };
+  return { provider: s.provider || State.agent, source_id: s.source_id, pid: s.project_id, sid: s.session_id, title: s.title, cost: s.cost, bytes: (s.size_bytes || 0) + (s.extra_bytes || 0) };
 }
 
 function sortedCleanup(sessions) {
@@ -1205,34 +1231,44 @@ function sortedCleanup(sessions) {
   return arr;
 }
 
-function applyPreset(id) {
-  const list = ((State.cleanup && State.cleanup.sessions) || []).filter((s) => !s.protected);
-  const now = Date.now();
-  clearSel();
-  let matched;
-  if (id === "large10") {
-    matched = [...list].sort((a, b) => (b.size_bytes + b.extra_bytes) - (a.size_bytes + a.extra_bytes)).slice(0, 10);
-  } else {
-    matched = list.filter((s) => {
-      const ageDays = (now - s.mtime * 1000) / 86400000;
-      if (id === "empty") return (s.assistant_messages || 0) === 0;
-      if (id === "small") return (s.assistant_messages || 0) <= 2;
-      if (id === "cheap") return (s.cost || 0) < 0.01;
-      if (id === "old") return ageDays > 30;
-      return false;
-    });
-  }
-  matched.forEach((s) => State.sel.set(selKey(s.project_id, s.session_id, s.provider), cleanupRec(s)));
+function filteredCleanupSessions() {
+  const f = State.cleanupFilters;
+  const q = f.query.trim().toLowerCase();
+  return sortedCleanup(((State.cleanup && State.cleanup.sessions) || []).filter((s) => {
+    const bytes = (s.size_bytes || 0) + (s.extra_bytes || 0);
+    const age = (Date.now() - (s.mtime || 0) * 1000) / 86400000;
+    const haystack = `${s.title || ""} ${s.project_name || ""} ${s.project_path || ""} ${s.session_id || ""}`.toLowerCase();
+    if (q && !haystack.includes(q)) return false;
+    if (f.age && age < f.age) return false;
+    if (f.minSize && bytes < f.minSize) return false;
+    if (f.maxTurns >= 0 && (s.assistant_messages || 0) > f.maxTurns) return false;
+    if (f.state === "active" && s.archived) return false;
+    if (f.state === "archived" && !s.archived) return false;
+    if (f.state === "cleanable" && (s.protected || (s.provider === "claude" && !s.source_writable) || s.archived)) return false;
+    if (f.asset && !(s.asset_bytes && s.asset_bytes[f.asset] > 0)) return false;
+    return true;
+  }));
+}
+
+function applyCleanupView(id) {
+  const f = State.cleanupFilters;
+  if (id === "stale") { f.age = 30; f.minSize = 0; f.state = "active"; }
+  if (id === "large") { f.minSize = 10e6; f.age = 0; f.state = "active"; }
+  if (id === "empty") { f.maxTurns = 0; f.age = 0; f.state = "active"; }
+  if (id === "media") { f.asset = "images"; f.state = "active"; }
+  if (id === "archived") { f.state = "archived"; }
   renderDetail();
-  if (!matched.length) toast("No sessions match that filter", "");
 }
 
 function cleanupView() {
   const c = State.cleanup;
   if (!c) return `<div class="detail-inner"><div class="skeleton">Scanning every session on disk…</div></div>`;
-  const fullList = sortedCleanup(c.sessions);
+  if (State.cleanupMode === "assets") return cleanupAssetsView();
+  const fullList = filteredCleanupSessions();
   const list = fullList.slice(0, State.cleanupLimit);
   const t = selTotals();
+  const reclaim = [...State.sel.values()].filter((item) => item.provider === "claude").reduce((sum, item) => sum + item.bytes, 0);
+  const archived = [...State.sel.values()].filter((item) => item.provider === "codex").reduce((sum, item) => sum + item.bytes, 0);
   const sort = State.cleanupSort;
   const sortBtn = (k, l) => `<button class="chip ${sort === k ? "on" : ""}" data-action="cleanup-sort" data-sort="${k}">${l}</button>`;
   return `<div class="detail-inner">
@@ -1242,21 +1278,29 @@ function cleanupView() {
     <div class="tiles">
       ${tile("Sessions", c.sessions.length, fmt.bytes(c.total_bytes) + " on disk", false,
         "Every transcript plus its ancillary data (tasks, file-history, images, session-env)")}
-      ${tile("Selected", t.count, State.agent === "claude" ? fmt.cost(t.cost) + " estimate" : "ready for cleanup", !!t.count, "Sessions currently checked")}
-      ${tile("Reclaims", fmt.bytes(t.bytes), t.count ? "estimated on-disk size" : "nothing selected", !!t.count,
-        "Codex archives remain recoverable; Claude deletion can reclaim this storage")}
+      ${tile("Selected", t.count, fmt.bytes(t.bytes) + " indexed", !!t.count, "Sessions currently checked")}
+      ${tile("Deletes", fmt.bytes(reclaim), reclaim ? "Claude storage" : "nothing selected", !!reclaim, "Permanent Claude deletion")}
+      ${tile("Archives", fmt.bytes(archived), archived ? "Codex stays on disk" : "nothing selected", !!archived, "Codex archive reclaims 0 B")}
     </div>
     <div class="section">
+      <div class="cleanup-tabs"><button class="chip on" data-action="cleanup-mode" data-mode="sessions">Sessions</button><button class="chip" data-action="cleanup-mode" data-mode="assets">Assets &amp; images</button></div>
+      <div class="filter-grid">
+        <input class="s-input" data-clean-filter="query" value="${esc(State.cleanupFilters.query)}" placeholder="Title, project, path or ID">
+        <select class="tune-select" data-clean-filter="age"><option value="0">Any age</option><option value="7" ${State.cleanupFilters.age === 7 ? "selected" : ""}>Inactive 7d+</option><option value="30" ${State.cleanupFilters.age === 30 ? "selected" : ""}>Inactive 30d+</option><option value="90" ${State.cleanupFilters.age === 90 ? "selected" : ""}>Inactive 90d+</option></select>
+        <select class="tune-select" data-clean-filter="minSize"><option value="0">Any size</option><option value="100000" ${State.cleanupFilters.minSize === 100000 ? "selected" : ""}>100 KB+</option><option value="1000000" ${State.cleanupFilters.minSize === 1000000 ? "selected" : ""}>1 MB+</option><option value="10000000" ${State.cleanupFilters.minSize === 10000000 ? "selected" : ""}>10 MB+</option></select>
+        <select class="tune-select" data-clean-filter="state"><option value="active" ${State.cleanupFilters.state === "active" ? "selected" : ""}>Active library</option><option value="cleanable" ${State.cleanupFilters.state === "cleanable" ? "selected" : ""}>Cleanable</option><option value="archived" ${State.cleanupFilters.state === "archived" ? "selected" : ""}>Archived Codex</option><option value="all" ${State.cleanupFilters.state === "all" ? "selected" : ""}>All states</option></select>
+        <select class="tune-select" data-clean-filter="maxTurns"><option value="-1">Any turns</option><option value="0" ${State.cleanupFilters.maxTurns === 0 ? "selected" : ""}>No assistant reply</option><option value="2" ${State.cleanupFilters.maxTurns === 2 ? "selected" : ""}>2 turns or fewer</option></select>
+      </div>
       <div class="cleanup-toolbar">
-        <span class="tb-label">Quick select</span>
-        ${PRESETS.filter(([id]) => id !== "cheap" || State.agent === "claude").map(([id, l, tip]) => `<button class="chip" data-action="cleanup-preset" data-preset="${id}" title="${esc(tip)}">${l}</button>`).join("")}
-        <button class="chip" data-action="sel-all">All</button>
+        <span class="tb-label">Views</span>
+        <button class="chip" data-action="cleanup-view" data-view="stale">Stale 30d+</button><button class="chip" data-action="cleanup-view" data-view="large">Large 10 MB+</button><button class="chip" data-action="cleanup-view" data-view="empty">No reply</button><button class="chip" data-action="cleanup-view" data-view="media">Has media</button>${State.agent !== "claude" ? '<button class="chip" data-action="cleanup-view" data-view="archived">Archived</button>' : ""}
+        <button class="chip" data-action="select-filtered">Select ${fullList.filter((s) => !s.protected && (s.provider === "codex" || s.source_writable) && !s.archived).length} matching safe</button>
         <button class="chip" data-action="sel-clear">None</button>
         <span class="tb-label" style="margin-left:auto">Sort</span>
         ${sortBtn("size", "Size")}${sortBtn("age", "Age")}${State.agent === "claude" ? sortBtn("cost", "Cost") : ""}
       </div>
       <div class="clean-list">
-        ${list.map(cleanupRow).join("") || '<div class="faint" style="padding:14px">No sessions on disk.</div>'}
+        ${list.map(cleanupRow).join("") || '<div class="faint" style="padding:14px">No sessions match these filters.</div>'}
         ${fullList.length > list.length ? `<button class="btn" data-action="cleanup-more" style="justify-content:center">Show 300 more · ${fullList.length - list.length} remaining</button>` : ""}
       </div>
     </div>
@@ -1265,23 +1309,67 @@ function cleanupView() {
 }
 
 function cleanupRow(s) {
-  const sel = isSel(s.project_id, s.session_id, s.provider);
-  const locked = !!s.protected;
+  const sel = isSel(s.project_id, s.session_id, s.provider, s.source_id);
+  const locked = !!s.protected || !!s.archived || (s.provider === "claude" && !s.source_writable);
   const size = (s.size_bytes || 0) + (s.extra_bytes || 0);
   const tags = [];
   if (s.active) tags.push('<span class="badge green"><span class="dot-active"></span> live</span>');
   if (s.has_subagents) tags.push(badge("subagents", "magenta"));
+  if (s.archived) tags.push(badge("archived"));
   tags.push(providerBadge(s.provider));
-  return `<div class="clean-row ${sel ? "sel" : ""} ${locked ? "live" : ""}" data-action="cleanup-row" data-provider="${esc(s.provider || State.agent)}" data-pid="${esc(s.project_id)}" data-sid="${esc(s.session_id)}">
-    ${locked ? '<span class="chk-lock" title="Recently active — deletion is temporarily blocked">🔒</span>' : `<input type="checkbox" class="chk" ${sel ? "checked" : ""} tabindex="-1">`}
+  tags.push(sourceBadge(s));
+  const lockReason = s.archived ? "Already archived" : (s.provider === "claude" && !s.source_writable ? "WSL Claude cleanup is read-only" : "Recently active");
+  return `<div class="clean-row ${sel ? "sel" : ""} ${locked ? "live" : ""}" data-action="cleanup-row" data-provider="${esc(s.provider || State.agent)}" data-source="${esc(s.source_id || "")}" data-pid="${esc(s.project_id)}" data-sid="${esc(s.session_id)}">
+    ${locked ? `<span class="chk-lock" title="${esc(lockReason)}">🔒</span>` : `<input type="checkbox" class="chk" ${sel ? "checked" : ""} tabindex="-1">`}
     <div class="cr-main">
       <div class="cr-title">${esc(s.title)}</div>
       <div class="cr-meta"><span class="cr-proj">${esc(s.project_name)}</span>
         <span>${s.assistant_messages} turns</span><span>${s.tool_calls} tools</span>
         <span>${fmt.rel(s.mtime)}</span>${tags.join("")}</div>
     </div>
-    <div class="cr-nums">${s.provider === "codex" ? "" : `<span class="p-cost">${fmt.cost(s.cost)}</span>`}<span class="cr-size">${fmt.bytes(size)}</span></div>
+    <div class="cr-nums">${s.provider === "codex" ? '<span class="faint">archive · 0 B reclaimed</span>' : `<span class="p-cost">${fmt.cost(s.cost)}</span>`}<span class="cr-size">${fmt.bytes(size)}</span></div>
   </div>`;
+}
+
+function filteredAssets() {
+  const f = State.cleanupFilters;
+  const q = f.query.trim().toLowerCase();
+  return [...((State.assets && State.assets.items) || [])].filter((item) => {
+    const age = (Date.now() - (item.mtime || 0) * 1000) / 86400000;
+    const haystack = `${item.kind} ${item.project_name || ""} ${item.title || ""} ${item.session_id || ""}`.toLowerCase();
+    return (!q || haystack.includes(q)) && (!f.age || age >= f.age) && (!f.minSize || item.size_bytes >= f.minSize)
+      && (!f.asset || item.kind === f.asset) && (f.state !== "orphaned" || item.orphaned);
+  }).sort((a, b) => b.size_bytes - a.size_bytes);
+}
+
+function cleanupAssetsView() {
+  if (!State.assets) return `<div class="detail-inner"><div class="skeleton">Inventorying images and agent storage…</div></div>`;
+  const items = filteredAssets();
+  const selected = [...State.assetSel.values()];
+  const bytes = selected.reduce((sum, item) => sum + item.size_bytes, 0);
+  const safe = items.filter((item) => !item.protected && item.source_writable);
+  return `<div class="detail-inner"><div class="page-head"><div><h1>Assets &amp; images</h1><div class="ph-sub">Clean storage categories independently from transcripts. Recent data stays protected for 10 minutes.</div></div></div>
+    <div class="tiles">${tile("Asset groups", (State.assets.items || []).length, fmt.bytes(State.assets.total_bytes), false, "Uploads, legacy images, file history, tasks, environments and scratchpads")}${tile("Matching", items.length, fmt.bytes(items.reduce((n, x) => n + x.size_bytes, 0)), false)}${tile("Selected", selected.length, fmt.bytes(bytes) + " reclaimable", !!selected.length)}</div>
+    <div class="section"><div class="cleanup-tabs"><button class="chip" data-action="cleanup-mode" data-mode="sessions">Sessions</button><button class="chip on" data-action="cleanup-mode" data-mode="assets">Assets &amp; images</button></div>
+      <div class="filter-grid"><input class="s-input" data-clean-filter="query" value="${esc(State.cleanupFilters.query)}" placeholder="Category, project or session">
+        <select class="tune-select" data-clean-filter="age"><option value="0">Any age</option><option value="7" ${State.cleanupFilters.age === 7 ? "selected" : ""}>Inactive 7d+</option><option value="30" ${State.cleanupFilters.age === 30 ? "selected" : ""}>Inactive 30d+</option><option value="90" ${State.cleanupFilters.age === 90 ? "selected" : ""}>Inactive 90d+</option></select>
+        <select class="tune-select" data-clean-filter="minSize"><option value="0">Any size</option><option value="100000">100 KB+</option><option value="1000000">1 MB+</option><option value="10000000">10 MB+</option></select>
+        <select class="tune-select" data-clean-filter="asset"><option value="">All categories</option>${["uploads", "legacy_images", "file_history", "tasks", "session_env", "scratchpad"].map((kind) => `<option value="${kind}" ${State.cleanupFilters.asset === kind ? "selected" : ""}>${kind.replaceAll("_", " ")}</option>`).join("")}</select>
+        <select class="tune-select" data-clean-filter="state"><option value="all">All states</option><option value="orphaned" ${State.cleanupFilters.state === "orphaned" ? "selected" : ""}>Orphaned only</option></select></div>
+      <div class="cleanup-toolbar"><button class="chip" data-action="select-assets">Select ${safe.length} matching safe</button><button class="chip" data-action="asset-clear">None</button><span class="faint">WSL Claude assets are visible but read-only.</span></div>
+      <div class="clean-list">${items.map((item) => { const key = `${item.source_id}␟${item.path}`; const on = State.assetSel.has(key); const locked = item.protected || !item.source_writable; return `<div class="clean-row ${on ? "sel" : ""} ${locked ? "readonly" : ""}" data-action="asset-row" data-key="${esc(key)}">${locked ? '<span class="chk-lock">🔒</span>' : `<input type="checkbox" class="chk" ${on ? "checked" : ""} tabindex="-1">`}<div class="cr-main"><div class="cr-title asset-kind">${esc(item.kind.replaceAll("_", " "))} ${item.orphaned ? badge("orphaned") : ""} ${sourceBadge(item)}</div><div class="cr-meta"><span>${esc(item.project_name)}</span><span>${item.file_count} files</span><span>${fmt.rel(item.mtime)}</span></div></div><div class="cr-nums"><span class="cr-size">${fmt.bytes(item.size_bytes)}</span></div></div>`; }).join("") || '<div class="faint" style="padding:14px">No assets match these filters.</div>'}</div>
+    </div>${selected.length ? `<div class="sel-bar"><div class="sb-info"><b>${selected.length}</b> groups · <b>${fmt.bytes(bytes)}</b> permanent reclaim</div><button class="btn sm" data-action="asset-clear">Clear</button><button class="btn sm primary danger" data-action="asset-delete">Delete selected assets</button></div>` : ""}</div>`;
+}
+
+function confirmAssetDelete() {
+  const items = [...State.assetSel.values()];
+  if (!items.length) return;
+  const bytes = items.reduce((sum, item) => sum + item.size_bytes, 0);
+  modal(`Delete ${items.length} asset group${items.length === 1 ? "" : "s"}?`, `${fmt.bytes(bytes)} of uploads, images or agent working data will be permanently removed. Transcripts remain.`, async () => {
+    const r = await call("deleteStorageAssets", JSON.stringify(items.map((item) => ({ source_id: item.source_id, kind: item.kind, session_id: item.session_id, path: item.path }))));
+    if (r && r.ok) { toast(`Deleted ${r.completed} asset group${r.completed === 1 ? "" : "s"}`, "ok"); State.assetSel.clear(); State.assets = await call("getStorageAssets", sourceScope()); renderDetail(); }
+    else toast((r && r.results && r.results[0] && r.results[0].error) || "Asset cleanup failed", "err");
+  });
 }
 
 function selBar() {
@@ -1295,9 +1383,9 @@ function selBar() {
 }
 
 async function loadCleanup() {
-  State.cleanup = null; State.cleanupLimit = 300; clearSel();
+  State.cleanup = null; State.assets = null; State.assetSel.clear(); State.cleanupLimit = 300; clearSel();
   renderDetail();
-  State.cleanup = await call("getProviderAllSessions", State.agent);
+  State.cleanup = await call("getProviderAllSessions", State.agent, sourceScope());
   renderDetail();
 }
 
@@ -1307,7 +1395,7 @@ function confirmBulkDelete() {
   const items = selItems();
   const hasClaude = items.some((x) => x.provider === "claude");
   const hasCodex = items.some((x) => x.provider === "codex");
-  const extra = hasClaude ? `<label class="checkbox-row"><input type="checkbox" id="bulk-purge" checked> Also purge Claude tasks, file-history, image-cache &amp; env</label>` : "";
+  const extra = hasClaude ? `<label class="checkbox-row"><input type="checkbox" id="bulk-purge"> Also delete Claude uploads, images, tasks, file history &amp; env</label>` : "";
   modal(`Clean up ${t.count} session${t.count === 1 ? "" : "s"}?`,
     `${hasClaude ? "Claude transcripts will be permanently deleted. " : ""}${hasCodex ? "Codex sessions will be archived through the Codex CLI and remain recoverable. " : ""}${fmt.bytes(t.bytes)} is currently indexed.`,
     async () => {
@@ -1319,7 +1407,7 @@ function confirmBulkDelete() {
         await loadOverview();
         if (State.view === "cleanup") await loadCleanup();
         else if (State.projectId) await selectProject(State.projectId);
-      } else toast("Delete failed", "err");
+      } else toast((r && r.results && r.results[0] && r.results[0].error) || "Cleanup failed", "err");
     }, extra);
 }
 
@@ -1338,6 +1426,8 @@ function tuneContextItems() {
 
 async function loadTune() {
   if (State.agent !== "claude") { State.tune = {}; renderDetail(); return; }
+  const source = State.sources.find((item) => item.id === State.source);
+  if (State.source === "all" || (source && source.kind === "wsl")) { State.tune = { source_readonly: true }; renderDetail(); return; }
   if (!State.tune) {
     State.tune = {
       mode: "guidance",       // guidance | memory
@@ -1354,7 +1444,7 @@ async function loadTune() {
   }
   renderDetail();
   if (!State.tune.sessions) {
-    const all = await call("getAllSessions");
+    const all = await call("getProviderAllSessions", "claude", sourceScope());
     State.tune.sessions = (all && all.sessions) || [];
   }
   await tuneRefreshGuidance();
@@ -1379,6 +1469,7 @@ function tuneView() {
   if (State.agent === "all") return `<div class="detail-inner">${emptyState("I", "Choose an agent", "Instructions stay separate. Select Claude for CLAUDE.md or Codex for AGENTS.md.")}</div>`;
   const t = State.tune;
   if (!t) return `<div class="detail-inner"><div class="skeleton">Loading…</div></div>`;
+  if (t.source_readonly) return `<div class="detail-inner">${emptyState("R", "Select Windows to tune instructions", "WSL histories can be browsed and measured, but instruction and memory writes stay read-only until their Linux file-routing capabilities are explicitly enabled.")}</div>`;
   const modeChip = (k, l) => `<button class="chip ${t.mode === k ? "on" : ""}" data-action="tune-mode" data-mode="${k}">${l}</button>`;
   return `<div class="detail-inner">
     <div class="page-head"><div><h1>Claude instructions</h1>
@@ -1561,10 +1652,54 @@ function emptyState(ic, title, sub) {
 /* ---------- data loaders ---------- */
 
 async function loadOverview() {
-  const [o, g] = await Promise.all([call("getProviderOverview", State.agent), call("getProviderGlobalStats", State.agent)]);
+  const scope = sourceScope();
+  const [o, g] = await Promise.all([call("getProviderOverview", State.agent, scope), call("getProviderGlobalStats", State.agent, scope)]);
   if (o) { State.projects = o.projects || []; State.agentHome = o.home; State.claudeHome = o.claude_home || (State.agent === "claude" ? o.home : State.claudeHome); State.codexHome = o.codex_home || (State.agent === "codex" ? o.home : State.codexHome); }
   renderRail();
   if (g) { State.globalStats = g; if (State.view === "overview" && !State.projectId) renderDetail(); }
+}
+
+async function loadSources(refresh = false) {
+  const data = await call(refresh ? "refreshSources" : "getSources");
+  State.sources = (data && data.sources) || [{ id: "windows", label: "Windows", kind: "local", available: true }];
+  const known = new Set(State.sources.map((source) => source.id));
+  State.enabledSources = new Set([...State.enabledSources].filter((id) => known.has(id)));
+  const local = State.sources.find((source) => source.kind === "local") || State.sources[0];
+  if (local) State.enabledSources.add(local.id);
+  if (State.source !== "all" && !State.enabledSources.has(State.source)) State.source = local ? local.id : "windows";
+  persistSources(); renderSourceSwitch();
+}
+
+function persistSources() {
+  localStorage.setItem("csm.enabledSources", JSON.stringify([...State.enabledSources]));
+  localStorage.setItem("csm.source", State.source);
+}
+
+function renderSourceSwitch() {
+  const select = document.getElementById("source-switch");
+  if (!select) return;
+  const enabled = State.sources.filter((source) => State.enabledSources.has(source.id));
+  select.innerHTML = `${enabled.length > 1 ? '<option value="all">All enabled</option>' : ""}${State.sources.map((source) => `<option value="${esc(source.id)}" ${State.enabledSources.has(source.id) ? "" : "disabled"}>${esc(source.label)}${State.enabledSources.has(source.id) ? "" : " (off)"}</option>`).join("")}`;
+  select.value = State.source;
+}
+
+async function switchSource(sourceId) {
+  if (sourceId !== "all" && !State.enabledSources.has(sourceId)) return;
+  if (sourceId === State.source) return;
+  if (backend && backend.leaveSession) backend.leaveSession();
+  State.source = sourceId; persistSources();
+  State.projectId = null; State.sessionId = null; State.sessions = []; State.detail = null; State.transcript = null;
+  State.settings = null; State.cleanup = null; State.assets = null; State.tune = null; State.view = "overview"; clearSel();
+  renderSourceSwitch(); renderListPane(); renderDetail(); await loadOverview(); renderDetail();
+}
+
+async function toggleSource(sourceId, enabled) {
+  const source = State.sources.find((item) => item.id === sourceId);
+  if (!source || source.kind === "local") return;
+  if (enabled) State.enabledSources.add(sourceId); else State.enabledSources.delete(sourceId);
+  if (!enabled && State.source === sourceId) State.source = (State.sources.find((item) => item.kind === "local") || {}).id || "windows";
+  persistSources(); renderSourceSwitch(); renderDetail();
+  await loadOverview();
 }
 
 async function selectProject(id, { keepSession = false } = {}) {
@@ -1611,6 +1746,8 @@ async function loadMemory(id) {
 }
 
 async function loadSettings() {
+  const source = State.sources.find((item) => item.id === State.source);
+  if (State.source === "all" || (source && source.kind === "wsl")) { State.settings = { source_only: true }; State.configFiles = []; renderDetail(); return; }
   if (State.agent === "all") { State.settings = {}; State.configFiles = []; renderDetail(); return; }
   State.settings = State.agent === "codex" ? await call("getCodexSettings") : await call("getSettings");
   State.statuslineStatus = State.agent === "claude" ? await call("statuslineStatus") : null;
@@ -1628,12 +1765,12 @@ async function openConfigFile(path) {
   box.innerHTML = `<div class="skeleton">Loading…</div>`;
   const r = await call("readFile", path);
   if (!r || !r.ok) { box.innerHTML = `<div class="faint">Could not read file.</div>`; return; }
-  box.innerHTML = `<div class="section-title" style="margin-top:4px">${esc(path.split("/").pop())}
+  box.innerHTML = `<div class="section-title" style="margin-top:4px">${esc(path.split(/[\\/]/).pop())}
       <span style="display:flex;gap:6px">
-        <button class="btn sm primary" data-action="cfg-save" data-path="${esc(path)}">Save</button>
+        <button class="btn sm primary" data-action="cfg-save" data-path="${esc(path)}" ${r.truncated ? "disabled" : ""}>Save</button>
         <button class="btn sm" data-action="open-editor" data-path="${esc(path)}">Open externally</button>
       </span></div>
-    <textarea class="editor" id="cfg-textarea" spellcheck="false">${esc(r.content)}${r.truncated ? "" : ""}</textarea>
+    <textarea class="editor" id="cfg-textarea" spellcheck="false" ${r.truncated ? "readonly" : ""}>${esc(r.content)}</textarea>
     ${r.truncated ? '<div class="truncated-note">File is large — editing here would truncate it. Use “Open externally”.</div>' : ""}`;
 }
 
@@ -1644,7 +1781,7 @@ async function saveConfigFile(path) {
   const r = State.agent === "codex"
     ? await call("writeCodexFile", path, ta.value, (project && project.path) || "")
     : await call("writeClaudeFile", path, ta.value);
-  toast(r && r.ok ? "Saved " + path.split("/").pop() : "Save failed", r && r.ok ? "ok" : "err");
+  toast(r && r.ok ? "Saved " + path.split(/[\\/]/).pop() : ((r && r.error) || "Save failed"), r && r.ok ? "ok" : "err");
 }
 
 /* ---------- workbench commands, shortcuts, and accessibility ---------- */
@@ -1684,7 +1821,8 @@ function updateChrome() {
   const scope = document.getElementById("status-scope");
   const summary = document.getElementById("status-summary");
   const project = projById(State.projectId);
-  if (scope) scope.textContent = `${agentInfo(State.agent).short} · ${project ? project.name : "All projects"}`;
+  const environment = State.source === "all" ? "All enabled" : ((State.sources.find((item) => item.id === State.source) || {}).label || State.source);
+  if (scope) scope.textContent = `${environment} · ${agentInfo(State.agent).short} · ${project ? project.name : "All projects"}`;
   if (summary) {
     if (State.view === "session" && State.sessionId) {
       const s = State.sessions.find((x) => x.session_id === State.sessionId) || {};
@@ -1695,7 +1833,7 @@ function updateChrome() {
 }
 
 function currentProject() {
-  return projById(State.projectId) || State.projects[0] || null;
+  return projById(State.projectId) || null;
 }
 
 async function launchClaudeSession(sessionId = "", path = "") {
@@ -1703,7 +1841,8 @@ async function launchClaudeSession(sessionId = "", path = "") {
   const cwd = path || (project && project.path) || "";
   if (!cwd) return void toast("Choose a project with an available folder first", "err");
   const provider = (State.sessions.find((x) => x.session_id === sessionId) || project || {}).provider || currentProvider();
-  const result = await call("launchAgent", provider, cwd, sessionId || "", "resume");
+  const sourceId = (State.sessions.find((x) => x.session_id === sessionId) || project || {}).source_id || State.source;
+  const result = await call("launchAgent", provider, sourceId, cwd, sessionId || "", "resume");
   if (result && result.ok) {
     const target = result.target === "desktop" ? " in the Codex desktop app" : (sessionId ? " in a terminal" : "");
     toast(sessionId ? `${agentInfo(provider).short} session opened${target}` : `New ${agentInfo(provider).short} session opened${target}`, "ok");
@@ -1862,6 +2001,9 @@ document.addEventListener("click", async (ev) => {
 
   switch (a) {
     case "switch-agent": return void switchAgent(t.dataset.agent, t.dataset.next || "");
+    case "refresh-sources": { await loadSources(true); await loadOverview(); renderDetail(); toast("Environments detected", "ok"); break; }
+    case "sources-all-on": { State.sources.filter((source) => source.kind === "wsl").forEach((source) => State.enabledSources.add(source.id)); persistSources(); renderSourceSwitch(); renderDetail(); toast("WSL sources enabled; they scan when selected or included in All", "ok"); break; }
+    case "sources-all-off": { State.sources.filter((source) => source.kind === "wsl").forEach((source) => State.enabledSources.delete(source.id)); if (State.source === "all" || String(State.source).startsWith("wsl:")) State.source = (State.sources.find((source) => source.kind === "local") || {}).id || "windows"; persistSources(); renderSourceSwitch(); await loadOverview(); renderDetail(); toast("WSL sources disabled", "ok"); break; }
     case "show-commands": return void openCommandPalette("all");
     case "show-shortcuts": return void showShortcuts();
     case "close-shortcuts": return void closeShortcuts();
@@ -1871,7 +2013,7 @@ document.addEventListener("click", async (ev) => {
     case "launch-resume": return void launchClaudeSession(State.sessionId);
     case "launch-fork": {
       const p = currentProject();
-      const r = await call("launchAgent", "codex", (p && p.path) || "", State.sessionId || "", "fork");
+      const r = await call("launchAgent", "codex", (p && p.source_id) || State.source, (p && p.path) || "", State.sessionId || "", "fork");
       toast(r && r.ok ? "Codex fork opened in a terminal" : ((r && r.error) || "Could not fork session"), r && r.ok ? "ok" : "err"); break;
     }
     case "project": return void selectProject(t.dataset.id);
@@ -1890,19 +2032,38 @@ document.addEventListener("click", async (ev) => {
       const s = State.sessions.find((x) => x.session_id === t.dataset.id);
       if (!s) break;
       if (s.active || s.protected) { toast("Recently active session — deletion is temporarily blocked", "err"); break; }
-      toggleSel({ provider: s.provider || currentProvider(), pid: State.projectId, sid: s.session_id, title: s.title, cost: s.cost, bytes: s.size_bytes || 0 });
+      toggleSel({ provider: s.provider || currentProvider(), source_id: s.source_id, pid: State.projectId, sid: s.session_id, title: s.title, cost: s.cost, bytes: s.size_bytes || 0 });
       keepScroll("list-pane", renderListPane);
       break;
     }
     case "cleanup-row": {
-      const s = ((State.cleanup && State.cleanup.sessions) || []).find((x) => x.provider === t.dataset.provider && x.project_id === t.dataset.pid && x.session_id === t.dataset.sid);
+      const s = ((State.cleanup && State.cleanup.sessions) || []).find((x) => x.provider === t.dataset.provider && x.source_id === t.dataset.source && x.project_id === t.dataset.pid && x.session_id === t.dataset.sid);
       if (!s) break;
-      if (s.active || s.protected) { toast("Recently active session — deletion is temporarily blocked", "err"); break; }
+      if (s.active || s.protected || s.archived || (s.provider === "claude" && !s.source_writable)) { toast("This item is protected or read-only", "err"); break; }
       toggleSel(cleanupRec(s));
       keepScroll("detail-pane", renderDetail);
       break;
     }
-    case "cleanup-preset": return void applyPreset(t.dataset.preset);
+    case "cleanup-view": return void applyCleanupView(t.dataset.view);
+    case "cleanup-mode": {
+      State.cleanupMode = t.dataset.mode;
+      if (State.cleanupMode === "assets" && !State.assets) { renderDetail(); State.assets = await call("getStorageAssets", sourceScope()); }
+      renderDetail(); break;
+    }
+    case "select-filtered": {
+      filteredCleanupSessions().filter((s) => !s.protected && !s.archived && (s.provider === "codex" || s.source_writable))
+        .forEach((s) => State.sel.set(selKey(s.project_id, s.session_id, s.provider, s.source_id), cleanupRec(s)));
+      renderDetail(); break;
+    }
+    case "asset-row": {
+      const item = ((State.assets && State.assets.items) || []).find((x) => `${x.source_id}␟${x.path}` === t.dataset.key);
+      if (!item || item.protected || !item.source_writable) { toast("This asset group is protected or read-only", "err"); break; }
+      if (State.assetSel.has(t.dataset.key)) State.assetSel.delete(t.dataset.key); else State.assetSel.set(t.dataset.key, item);
+      keepScroll("detail-pane", renderDetail); break;
+    }
+    case "select-assets": { filteredAssets().filter((item) => !item.protected && item.source_writable).forEach((item) => State.assetSel.set(`${item.source_id}␟${item.path}`, item)); renderDetail(); break; }
+    case "asset-clear": { State.assetSel.clear(); renderDetail(); break; }
+    case "asset-delete": return void confirmAssetDelete();
     case "cleanup-sort": { State.cleanupSort = t.dataset.sort; renderDetail(); break; }
     case "cleanup-more": { State.cleanupLimit += 300; keepScroll("detail-pane", renderDetail); break; }
     case "tune-mode": {
@@ -1939,7 +2100,7 @@ document.addEventListener("click", async (ev) => {
         keepScroll("detail-pane", renderDetail);
       } else {
         State.sessions.filter((s) => !s.protected)
-          .forEach((s) => State.sel.set(selKey(State.projectId, s.session_id, s.provider), { provider: s.provider || currentProvider(), pid: State.projectId, sid: s.session_id, title: s.title, cost: s.cost, bytes: s.size_bytes || 0 }));
+          .forEach((s) => State.sel.set(selKey(State.projectId, s.session_id, s.provider, s.source_id), { provider: s.provider || currentProvider(), source_id: s.source_id, pid: State.projectId, sid: s.session_id, title: s.title, cost: s.cost, bytes: s.size_bytes || 0 }));
         keepScroll("list-pane", renderListPane);
       }
       break;
@@ -2032,6 +2193,14 @@ document.addEventListener("change", async (ev) => {
 /* settings: privacy switches, add-a-setting picker, and every editable control
    write straight to settings.json on change (empty text field = remove the key) */
 document.addEventListener("change", async (ev) => {
+  const clean = ev.target.closest("[data-clean-filter]");
+  if (clean) {
+    const key = clean.dataset.cleanFilter;
+    State.cleanupFilters[key] = ["query", "state", "asset"].includes(key) ? clean.value : Number(clean.value);
+    renderDetail(); return;
+  }
+  const sourceToggle = ev.target.closest("[data-role='source-toggle']");
+  if (sourceToggle) return void toggleSource(sourceToggle.dataset.source, sourceToggle.checked);
   const pv = ev.target.closest("[data-role='privacy']");
   if (pv) return void applyPrivacy(pv.dataset.key, pv.checked);
   const add = ev.target.closest("[data-role='add-setting']");
@@ -2055,10 +2224,12 @@ document.getElementById("agent-switch").addEventListener("click", (ev) => {
   const button = ev.target.closest("[data-agent]");
   if (button) switchAgent(button.dataset.agent);
 });
+document.getElementById("source-switch").addEventListener("change", (ev) => switchSource(ev.target.value));
 
 async function loadMonitor() {
   renderDetail();
-  if (State.agent !== "claude") return;
+  const source = State.sources.find((item) => item.id === State.source);
+  if (State.agent !== "claude" || State.source === "all" || (source && source.kind === "wsl")) { State.shells = { snapshots: [], environments: [] }; return void renderDetail(); }
   const [settings, shells] = await Promise.all([call("getSettings"), call("getShells")]);
   State.settings = settings || State.settings;
   State.shells = shells || State.shells;
@@ -2091,6 +2262,14 @@ document.getElementById("search").addEventListener("keydown", (e) => {
     if (State.view === "search") { State.view = State.projectId ? "project" : "overview"; }
     renderRail(); renderListPane(); renderDetail();
   }
+});
+document.addEventListener("input", (ev) => {
+  const clean = ev.target.closest("[data-clean-filter='query']");
+  if (!clean) return;
+  State.cleanupFilters.query = clean.value;
+  renderDetail();
+  const next = document.querySelector("[data-clean-filter='query']");
+  if (next) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); }
 });
 
 document.addEventListener("keydown", async (e) => {
@@ -2196,13 +2375,14 @@ function confirmDeleteSession() {
   const html = `<label class="checkbox-row"><input type="checkbox" id="purge-chk"> Also purge tasks, file-history, image-cache & env</label>`;
   modal("Delete this session?", "This permanently deletes the transcript. This cannot be undone.", async () => {
     const purge = document.getElementById("purge-chk") && document.getElementById("purge-chk").checked;
-    const r = await call("deleteSession", State.projectId, State.sessionId, !!purge);
+    const project = currentProject();
+    const r = await call("cleanupSessions", JSON.stringify([{ provider: "claude", source_id: (project && project.source_id) || State.source, project_id: State.projectId, session_id: State.sessionId }]), !!purge);
     if (r && r.ok) {
       toast("Session deleted", "ok");
       State.sessionId = null; State.detail = null; State.view = "project";
       await loadOverview();
       await selectProject(State.projectId);
-    } else toast("Delete failed", "err");
+    } else toast((r && r.results && r.results[0] && r.results[0].error) || "Delete failed", "err");
   }, html);
 }
 
@@ -2281,13 +2461,14 @@ function onDataChanged(reason) {
 
 function confirmArchiveSession() {
   modal("Archive this Codex session?", "Codex will move it out of the active session list. The archive remains recoverable from Codex storage.", async () => {
-    const r = await call("archiveCodexSession", State.sessionId || "");
+    const project = currentProject();
+    const r = await call("cleanupSessions", JSON.stringify([{ provider: "codex", source_id: (project && project.source_id) || State.source, project_id: State.projectId, session_id: State.sessionId || "" }]), false);
     if (r && r.ok) {
       toast("Codex session archived", "ok");
       State.sessionId = null; State.detail = null; State.view = "project";
       await loadOverview();
       if (State.projectId) await selectProject(State.projectId);
-    } else toast((r && r.error) || "Archive failed", "err");
+    } else toast((r && r.results && r.results[0] && r.results[0].error) || "Archive failed", "err");
   });
 }
 
@@ -2364,6 +2545,7 @@ function boot() {
     backend.assistantEvent.connect(onAssistantEvent);
     const info = await call("getAppInfo");
     document.body.classList.toggle("custom-window-controls", !!(info && info.custom_window_controls));
+    await loadSources();
     await loadOverview();
     renderListPane();
     renderDetail();

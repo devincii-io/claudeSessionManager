@@ -20,6 +20,7 @@ from PySide6.QtCore import QObject, QProcess, QTimer, Signal, Slot
 from . import actions, assistant, paths
 from .scanner import Scanner
 from .codex_scanner import CodexScanner
+from .sources import Source, discover_sources, refresh_sources, source_by_id
 from .watcher import Watcher
 
 
@@ -35,9 +36,14 @@ class Bridge(QObject):
         super().__init__()
         self._scanner = scanner
         self._codex = CodexScanner()
+        local = discover_sources()[0]
+        self._local_source_id = local.id
+        self._source_scanners: dict[str, tuple[Scanner, CodexScanner]] = {
+            local.id: (scanner, self._codex)
+        }
         self._watcher = watcher
         self._window = None  # set by the application shell
-        self._open_session: tuple[str, str, str] | None = None
+        self._open_session: tuple[str, str, str, str] | None = None
         self._pending_reason: str | None = None
         self._jobs: dict[str, tuple[QProcess, str, QTimer]] = {}
 
@@ -52,6 +58,60 @@ class Bridge(QObject):
         self._max_wait.setInterval(1000)
         self._max_wait.timeout.connect(self._flush)
         self._watcher.fileEvent.connect(self._on_fs_event)
+
+    # -- source registry --------------------------------------------------- #
+
+    def _source_pair(self, source_id: str) -> tuple[Source, Scanner, CodexScanner] | None:
+        source = source_by_id(source_id, resolve=True)
+        if source is None or not source.available or not source.resolved:
+            return None
+        pair = self._source_scanners.get(source.id)
+        if pair is None:
+            pair = (
+                Scanner(source.claude_home, cache_namespace=source.id, temp_roots=source.temp_roots),
+                CodexScanner(source.codex_home),
+            )
+            self._source_scanners[source.id] = pair
+        return source, pair[0], pair[1]
+
+    def _scope(self, scope_json: str) -> list[tuple[Source, Scanner, CodexScanner]]:
+        try:
+            requested = json.loads(scope_json) if scope_json else [self._local_source_id]
+        except (json.JSONDecodeError, TypeError):
+            requested = [scope_json or self._local_source_id]
+        if not isinstance(requested, list) or not requested:
+            requested = [self._local_source_id]
+        result = []
+        for source_id in requested:
+            pair = self._source_pair(str(source_id))
+            if pair is not None:
+                result.append(pair)
+        return result
+
+    @staticmethod
+    def _project_id(source_id: str, native_id: str) -> str:
+        return f"{source_id}::{native_id}"
+
+    def _split_project_id(self, project_id: str) -> tuple[str, str]:
+        if "::" in project_id:
+            return tuple(project_id.split("::", 1))  # type: ignore[return-value]
+        return self._local_source_id, project_id
+
+    def _decorate(self, item: dict, source: Source, provider: str, *, project: bool = False) -> dict:
+        result = dict(item)
+        result.update({
+            "source_id": source.id, "source_label": source.label,
+            "source_kind": source.kind, "source_writable": source.writable,
+            "provider": provider,
+        })
+        if project:
+            result["native_id"] = item.get("id", "")
+            result["id"] = self._project_id(source.id, str(item.get("id", "")))
+            if source.kind == "wsl" and str(item.get("path", "")).startswith("/"):
+                result["exists"] = source.available
+        elif item.get("project_id"):
+            result["project_id"] = self._project_id(source.id, str(item["project_id"]))
+        return result
 
     # -- filesystem → UI ---------------------------------------------------- #
 
@@ -100,26 +160,33 @@ class Bridge(QObject):
     def getOverview(self) -> str:
         return _j({"projects": self._scanner.scan_projects(), "home": str(paths.claude_home())})
 
-    @Slot(str, result=str)
-    def getProviderOverview(self, provider: str) -> str:
-        if provider == "codex":
-            projects = self._codex.scan_projects()
-            home = paths.codex_home()
-        elif provider == "all":
-            claude_projects = self._scanner.scan_projects()
-            for item in claude_projects:
-                item["provider"] = "claude"
-            projects = claude_projects + self._codex.scan_projects()
-            projects.sort(key=lambda item: item.get("last_activity", 0), reverse=True)
-            home = ""
-        else:
-            projects = self._scanner.scan_projects()
-            for item in projects:
-                item["provider"] = "claude"
-            home = paths.claude_home()
+    @Slot(result=str)
+    def getSources(self) -> str:
+        return _j({"sources": [source.to_dict() for source in discover_sources()]})
+
+    @Slot(result=str)
+    def refreshSources(self) -> str:
+        sources = refresh_sources()
+        return _j({"sources": [source.to_dict() for source in sources]})
+
+    @Slot(str, str, result=str)
+    def getProviderOverview(self, provider: str, source_scope: str) -> str:
+        projects: list[dict] = []
+        source_rows = self._scope(source_scope)
+        for source, claude, codex in source_rows:
+            if provider in {"claude", "all"}:
+                projects.extend(self._decorate(item, source, "claude", project=True) for item in claude.scan_projects())
+            if provider in {"codex", "all"}:
+                projects.extend(self._decorate(item, source, "codex", project=True) for item in codex.scan_projects())
+        projects.sort(key=lambda item: item.get("last_activity", 0), reverse=True)
+        home = ""
+        if len(source_rows) == 1 and provider != "all":
+            source, claude, codex = source_rows[0]
+            home = claude.home if provider == "claude" else codex.home
         return _j({
             "provider": provider, "projects": projects, "home": str(home),
             "claude_home": str(paths.claude_home()), "codex_home": str(paths.codex_home()),
+            "sources": [source.to_dict() for source, _c, _x in source_rows],
         })
 
     @Slot(result=str)
@@ -135,17 +202,20 @@ class Bridge(QObject):
 
     @Slot(str, str, result=str)
     def getProviderSessions(self, provider: str, project_id: str) -> str:
-        if provider == "codex":
-            sessions = self._codex.list_sessions(project_id)
-        else:
-            sessions = self._scanner.list_sessions(project_id)
-            for item in sessions:
-                item["provider"] = "claude"
+        source_id, native_id = self._split_project_id(project_id)
+        pair = self._source_pair(source_id)
+        if pair is None:
+            return _j({"provider": provider, "sessions": [], "project": project_id, "error": "Source unavailable"})
+        source, claude, codex = pair
+        scanner = codex if provider == "codex" else claude
+        sessions = [self._decorate(item, source, provider) for item in scanner.list_sessions(native_id)]
+        for item in sessions:
+            item["project_id"] = project_id
         return _j({"provider": provider, "sessions": sessions, "project": project_id})
 
     @Slot(str, str, result=str)
     def getSessionDetail(self, project_id: str, session_id: str) -> str:
-        if self._open_session and self._open_session != ("claude", project_id, session_id):
+        if self._open_session and self._open_session != (self._local_source_id, "claude", project_id, session_id):
             self._release_open_session()
         project_path = self._scanner.project_path(project_id)
         jsonl = paths.projects_dir() / project_id / f"{session_id}.jsonl"
@@ -158,46 +228,58 @@ class Bridge(QObject):
         data["session_id"] = session_id
         data["project_id"] = project_id
         # Live-watch this session's workspace while it's open.
-        self._open_session = ("claude", project_id, session_id)
+        self._open_session = (self._local_source_id, "claude", project_id, session_id)
         self._watcher.watch_scratchpad(scratch.get("dir") or None)
         return _j(data)
 
     @Slot(str, str, str, result=str)
     def getProviderSessionDetail(self, provider: str, project_id: str, session_id: str) -> str:
-        if self._open_session and self._open_session != (provider, project_id, session_id):
+        source_id, native_id = self._split_project_id(project_id)
+        pair = self._source_pair(source_id)
+        if pair is None:
+            return _j({"events": [], "error": "Source unavailable"})
+        source, claude, codex = pair
+        if self._open_session and self._open_session != (source_id, provider, native_id, session_id):
             self._release_open_session()
         if provider == "codex":
-            data = self._codex.detail(project_id, session_id)
-            path = self._codex.session_path(project_id, session_id)
+            data = codex.detail(native_id, session_id)
+            path = codex.session_path(native_id, session_id)
             data.update({
                 "path": str(path) if path else "", "tasks": [], "scratchpad": {"files": []},
                 "images": [], "file_history": [], "session_id": session_id, "project_id": project_id,
             })
-            self._watcher.watch_scratchpad(None)
+            if source_id == self._local_source_id:
+                self._watcher.watch_scratchpad(None)
         else:
-            project_path = self._scanner.project_path(project_id)
-            jsonl = paths.projects_dir() / project_id / f"{session_id}.jsonl"
-            data = self._scanner.detail(jsonl) if jsonl.is_file() else {"events": [], "error": "not found"}
+            project_path = claude.project_path(native_id)
+            jsonl = claude.projects_root / native_id / f"{session_id}.jsonl"
+            data = claude.detail(jsonl) if jsonl.is_file() else {"events": [], "error": "not found"}
             data.update({
                 "provider": "claude", "path": str(jsonl),
-                "tasks": self._scanner.get_tasks(session_id),
-                "scratchpad": self._scanner.get_scratchpad(project_path, session_id),
-                "images": self._scanner.get_images(session_id),
-                "file_history": self._scanner.get_file_history(session_id),
+                "tasks": claude.get_tasks(session_id),
+                "scratchpad": claude.get_scratchpad(project_path, session_id),
+                "images": claude.get_images(session_id),
+                "file_history": claude.get_file_history(session_id),
                 "session_id": session_id, "project_id": project_id,
             })
-            self._watcher.watch_scratchpad(data["scratchpad"].get("dir") or None)
-        self._open_session = (provider, project_id, session_id)
+            if source_id == self._local_source_id:
+                self._watcher.watch_scratchpad(data["scratchpad"].get("dir") or None)
+        data.update({"source_id": source.id, "source_label": source.label, "source_kind": source.kind})
+        self._open_session = (source_id, provider, native_id, session_id)
         return _j(data)
 
     def _release_open_session(self) -> None:
         if not self._open_session:
             return
-        provider, project_id, session_id = self._open_session
+        source_id, provider, project_id, session_id = self._open_session
+        pair = self._source_pair(source_id)
+        if pair is None:
+            return
+        _source, claude, codex = pair
         if provider == "codex":
-            self._codex.release_detail(project_id, session_id)
+            codex.release_detail(project_id, session_id)
         else:
-            self._scanner.release_detail(project_id, session_id)
+            claude.release_detail(project_id, session_id)
 
     @Slot()
     def leaveSession(self) -> None:
@@ -219,37 +301,43 @@ class Bridge(QObject):
 
     @Slot(str, str, str, int, int, result=str)
     def getProviderTranscriptBefore(self, provider: str, project_id: str, session_id: str, before: int, count: int) -> str:
+        source_id, native_id = self._split_project_id(project_id)
+        pair = self._source_pair(source_id)
+        if pair is None:
+            return _j({"events": [], "error": "Source unavailable"})
+        _source, claude, codex = pair
         if provider == "codex":
-            return _j(self._codex.transcript_before(project_id, session_id, before, count))
-        jsonl = paths.projects_dir() / project_id / f"{session_id}.jsonl"
-        return _j(self._scanner.transcript_before(jsonl, before, count))
+            return _j(codex.transcript_before(native_id, session_id, before, count))
+        return _j(claude.transcript_before(claude.projects_root / native_id / f"{session_id}.jsonl", before, count))
 
     @Slot(str, str, str, int, result=str)
     def getProviderTranscriptAfter(self, provider: str, project_id: str, session_id: str, after: int) -> str:
+        source_id, native_id = self._split_project_id(project_id)
+        pair = self._source_pair(source_id)
+        if pair is None:
+            return _j({"events": [], "error": "Source unavailable"})
+        _source, claude, codex = pair
         if provider == "codex":
-            return _j(self._codex.transcript_after(project_id, session_id, after))
-        jsonl = paths.projects_dir() / project_id / f"{session_id}.jsonl"
-        return _j(self._scanner.transcript_after(jsonl, after))
+            return _j(codex.transcript_after(native_id, session_id, after))
+        return _j(claude.transcript_after(claude.projects_root / native_id / f"{session_id}.jsonl", after))
 
     @Slot(str, result=str)
     def searchAll(self, query: str) -> str:
         return _j(self._scanner.search_all(query))
 
-    @Slot(str, str, result=str)
-    def searchProvider(self, provider: str, query: str) -> str:
-        if provider == "codex":
-            return _j(self._codex.search_all(query))
-        claude = self._scanner.search_all(query)
-        for kind in ("sessions", "prompts"):
-            for item in claude.get(kind, []):
-                item["provider"] = "claude"
-        if provider == "claude":
-            return _j(claude)
-        codex = self._codex.search_all(query)
-        sessions = claude.get("sessions", []) + codex.get("sessions", [])
+    @Slot(str, str, str, result=str)
+    def searchProvider(self, provider: str, source_scope: str, query: str) -> str:
+        sessions: list[dict] = []
+        prompts: list[dict] = []
+        for source, claude, codex in self._scope(source_scope):
+            scanners = (("claude", claude), ("codex", codex)) if provider == "all" else ((provider, codex if provider == "codex" else claude),)
+            for agent, scanner in scanners:
+                data = scanner.search_all(query)
+                sessions.extend(self._decorate(item, source, agent) for item in data.get("sessions", []))
+                prompts.extend(self._decorate(item, source, agent) for item in data.get("prompts", []))
         sessions.sort(key=lambda item: item.get("mtime", 0), reverse=True)
-        prompts = claude.get("prompts", []) + codex.get("prompts", [])
-        return _j({"provider": "all", "sessions": sessions[:100], "prompts": prompts[:100]})
+        prompts.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
+        return _j({"provider": provider, "sessions": sessions[:100], "prompts": prompts[:100]})
 
     @Slot(result=str)
     def getShells(self) -> str:
@@ -259,55 +347,83 @@ class Bridge(QObject):
     def getGlobalStats(self) -> str:
         return _j(self._scanner.global_stats())
 
-    @Slot(str, result=str)
-    def getProviderGlobalStats(self, provider: str) -> str:
-        if provider == "codex":
-            return _j(self._codex.global_stats())
-        claude = self._scanner.global_stats()
-        claude["provider"] = "claude"
-        claude["cost_available"] = True
-        if provider == "claude":
-            return _j(claude)
-        codex = self._codex.global_stats()
+    @Slot(str, str, result=str)
+    def getProviderGlobalStats(self, provider: str, source_scope: str) -> str:
+        stats: list[tuple[str, str, dict]] = []
+        for source, claude, codex in self._scope(source_scope):
+            if provider in {"claude", "all"}:
+                stats.append((source.id, "claude", claude.global_stats()))
+            if provider in {"codex", "all"}:
+                stats.append((source.id, "codex", codex.global_stats()))
         usage = {}
-        for key in set(claude.get("usage", {})) | set(codex.get("usage", {})):
-            usage[key] = int(claude.get("usage", {}).get(key, 0) or 0) + int(codex.get("usage", {}).get(key, 0) or 0)
         by_model = {}
-        for source in (claude.get("by_model", {}), codex.get("by_model", {})):
-            for model, values in source.items():
+        tools: Counter = Counter()
+        days: Counter = Counter()
+        result = {
+            "provider": provider, "cost": 0.0,
+            "cost_available": provider == "claude", "usage": usage,
+            "by_model": by_model, "tool_counts": {}, "sessions_by_day": [],
+            "sources": [],
+        }
+        for source_id, agent, data in stats:
+            result["sources"].append({"source_id": source_id, "provider": agent, "sessions": data.get("sessions", 0)})
+            if agent == "claude":
+                result["cost"] += float(data.get("cost", 0) or 0)
+            for key, value in data.get("usage", {}).items():
+                usage[key] = int(usage.get(key, 0)) + int(value or 0)
+            for model, values in data.get("by_model", {}).items():
                 bucket = by_model.setdefault(model, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total": 0, "cost": 0.0})
                 for key in ("input", "output", "cache_read", "cache_write", "reasoning_output", "total"):
                     bucket[key] = bucket.get(key, 0) + int(values.get(key, 0) or 0)
                 bucket["cost"] += float(values.get("cost", 0) or 0)
-        tools = Counter(claude.get("tool_counts", {})); tools.update(codex.get("tool_counts", {}))
-        days = Counter(dict(claude.get("sessions_by_day", []))); days.update(dict(codex.get("sessions_by_day", [])))
-        result = {"provider": "all", "cost": claude.get("cost", 0), "cost_available": False, "usage": usage,
-                  "by_model": by_model, "tool_counts": dict(tools.most_common(14)), "sessions_by_day": sorted(days.items())[-14:]}
-        for key in ("sessions", "active", "prompts", "turns", "tool_calls", "subagent_sessions"):
-            result[key] = int(claude.get(key, 0) or 0) + int(codex.get(key, 0) or 0)
+            tools.update(data.get("tool_counts", {}))
+            days.update(dict(data.get("sessions_by_day", [])))
+            for key in ("sessions", "active", "prompts", "turns", "tool_calls", "subagent_sessions"):
+                result[key] = int(result.get(key, 0)) + int(data.get(key, 0) or 0)
+        result["tool_counts"] = dict(tools.most_common(14))
+        result["sessions_by_day"] = sorted(days.items())[-14:]
         return _j(result)
 
     @Slot(result=str)
     def getAllSessions(self) -> str:
         return _j(self._scanner.all_sessions())
 
-    @Slot(str, result=str)
-    def getProviderAllSessions(self, provider: str) -> str:
-        if provider == "codex":
-            return _j(self._codex.all_sessions())
-        claude = self._scanner.all_sessions()
-        for item in claude.get("sessions", []):
-            item["provider"] = "claude"
-        if provider == "claude":
-            return _j(claude)
-        codex = self._codex.all_sessions()
-        sessions = claude.get("sessions", []) + codex.get("sessions", [])
+    @Slot(str, str, result=str)
+    def getProviderAllSessions(self, provider: str, source_scope: str) -> str:
+        sessions: list[dict] = []
+        source_totals: list[dict] = []
+        for source, claude, codex in self._scope(source_scope):
+            scanners = (("claude", claude), ("codex", codex)) if provider == "all" else ((provider, codex if provider == "codex" else claude),)
+            for agent, scanner in scanners:
+                data = scanner.all_sessions()
+                rows = [self._decorate(item, source, agent) for item in data.get("sessions", [])]
+                sessions.extend(rows)
+                source_totals.append({"source_id": source.id, "source_label": source.label, "provider": agent, "bytes": data.get("total_bytes", 0), "sessions": len(rows)})
         sessions.sort(key=lambda item: item.get("size_bytes", 0) + item.get("extra_bytes", 0), reverse=True)
-        return _j({"provider": "all", "sessions": sessions, "home": "", "total_bytes": claude.get("total_bytes", 0) + codex.get("total_bytes", 0), "cost_available": False})
+        return _j({"provider": provider, "sessions": sessions, "home": "", "total_bytes": sum(item["bytes"] for item in source_totals), "cost_available": provider == "claude", "source_totals": source_totals})
+
+    @Slot(str, result=str)
+    def getStorageAssets(self, source_scope: str) -> str:
+        items: list[dict] = []
+        for source, claude, _codex in self._scope(source_scope):
+            data = claude.storage_assets()
+            for item in data.get("items", []):
+                row = self._decorate(item, source, "claude")
+                row["source_writable"] = source.id == self._local_source_id
+                items.append(row)
+        items.sort(key=lambda item: item.get("size_bytes", 0), reverse=True)
+        return _j({"items": items, "total_bytes": sum(item.get("size_bytes", 0) for item in items)})
 
     @Slot(str, result=str)
     def getMemory(self, project_id: str) -> str:
-        return _j(self._scanner.get_memory(project_id))
+        source_id, native_id = self._split_project_id(project_id)
+        pair = self._source_pair(source_id)
+        if pair is None:
+            return _j({"files": [], "error": "Source unavailable"})
+        source, claude, _codex = pair
+        data = claude.get_memory(native_id)
+        data.update({"source_id": source.id, "source_label": source.label, "source_writable": source.id == self._local_source_id})
+        return _j(data)
 
     @Slot(result=str)
     def getSettings(self) -> str:
@@ -359,8 +475,13 @@ class Bridge(QObject):
     def launchClaude(self, project_path: str, session_id: str) -> str:
         return _j(actions.launch_claude(project_path, session_id))
 
-    @Slot(str, str, str, str, result=str)
-    def launchAgent(self, provider: str, project_path: str, session_id: str, mode: str) -> str:
+    @Slot(str, str, str, str, str, result=str)
+    def launchAgent(self, provider: str, source_id: str, project_path: str, session_id: str, mode: str) -> str:
+        source = source_by_id(source_id, resolve=True)
+        if source is None or not source.available:
+            return _j({"ok": False, "error": "Source unavailable"})
+        if source.kind == "wsl":
+            return _j(actions.launch_wsl_session(source.distro, provider, project_path, session_id, mode))
         return _j(actions.launch_session(provider, project_path, session_id, mode))
 
     @Slot(str, result=str)
@@ -384,18 +505,60 @@ class Bridge(QObject):
         results = []
         for item in items if isinstance(items, list) else []:
             provider = (item or {}).get("provider", "claude")
+            source_id = (item or {}).get("source_id", self._local_source_id)
             sid = (item or {}).get("session_id", "")
             pid = (item or {}).get("project_id", "")
+            parsed_source, native_pid = self._split_project_id(pid)
+            if source_id != parsed_source:
+                result = {"ok": False, "error": "Source identity mismatch"}
+                results.append({"provider": provider, "source_id": source_id, "project_id": pid, "session_id": sid, **result})
+                continue
+            pair = self._source_pair(source_id)
+            if pair is None:
+                result = {"ok": False, "error": "Source unavailable"}
+                results.append({"provider": provider, "source_id": source_id, "project_id": pid, "session_id": sid, **result})
+                continue
+            source, claude, codex = pair
             if provider == "codex":
-                path = self._codex.session_path(pid, sid)
+                path = codex.session_path(native_pid, sid)
                 try:
                     protected = path is not None and path.is_file() and time.time() - path.stat().st_mtime <= 600
                 except OSError:
                     protected = False
-                result = {"ok": False, "error": "Recently active"} if protected else actions.archive_codex_session(sid)
+                if protected:
+                    result = {"ok": False, "error": "Recently active"}
+                elif source.kind == "wsl":
+                    result = actions.archive_wsl_codex_session(source.distro, sid)
+                else:
+                    result = actions.archive_codex_session(sid)
             else:
-                result = actions.delete_session(pid, sid, purge)
-            results.append({"provider": provider, "project_id": pid, "session_id": sid, **result})
+                result = actions.delete_session(native_pid, sid, purge) if source.id == self._local_source_id else {"ok": False, "error": "WSL Claude cleanup is read-only for safety"}
+            results.append({"provider": provider, "source_id": source_id, "project_id": pid, "session_id": sid, **result})
+        completed = sum(1 for item in results if item.get("ok"))
+        return _j({"ok": completed > 0, "completed": completed, "count": len(results), "results": results})
+
+    @Slot(str, result=str)
+    def deleteStorageAssets(self, items_json: str) -> str:
+        try:
+            requested = json.loads(items_json)
+        except json.JSONDecodeError:
+            requested = []
+        local_pair = self._source_pair(self._local_source_id)
+        if local_pair is None:
+            return _j({"ok": False, "completed": 0, "results": []})
+        _source, claude, _codex = local_pair
+        inventory = claude.storage_assets().get("items", [])
+        allowed = {item["path"] for item in inventory if not item.get("protected")}
+        by_identity = {(item.get("kind"), item.get("session_id"), item.get("path")): item for item in inventory}
+        results = []
+        for req in requested if isinstance(requested, list) else []:
+            if req.get("source_id") != self._local_source_id:
+                result = {"ok": False, "error": "Only Windows assets are writable"}
+            else:
+                key = (req.get("kind"), req.get("session_id"), req.get("path"))
+                item = by_identity.get(key)
+                result = actions.delete_inventory_path(item["path"], allowed) if item and not item.get("protected") else {"ok": False, "error": "Asset is protected or no longer present"}
+            results.append({**req, **result})
         completed = sum(1 for item in results if item.get("ok"))
         return _j({"ok": completed > 0, "completed": completed, "count": len(results), "results": results})
 
@@ -465,7 +628,10 @@ class Bridge(QObject):
             notes = json.loads(notes_json)
         except json.JSONDecodeError:
             notes = []
-        return _j(actions.write_memory_notes(project_id, notes))
+        source_id, native_id = self._split_project_id(project_id)
+        if source_id != self._local_source_id:
+            return _j({"ok": False, "error": "WSL memory is read-only"})
+        return _j(actions.write_memory_notes(native_id, notes))
 
     @Slot(str, result=str)
     def startAssistant(self, req_json: str) -> str:
@@ -483,7 +649,15 @@ class Bridge(QObject):
             return _j({"ok": False, "error": "The 'claude' CLI was not found. Install Claude Code and sign in."})
 
         kind = req.get("kind", "tune")
-        summaries = self._scanner.summaries_for(req.get("sessions") or [])
+        summaries: list[dict] = []
+        grouped: dict[str, list[dict]] = {}
+        for item in req.get("sessions") or []:
+            source_id, native_id = self._split_project_id(str((item or {}).get("project_id", "")))
+            grouped.setdefault(source_id, []).append({**item, "project_id": native_id})
+        for source_id, items in grouped.items():
+            pair = self._source_pair(source_id)
+            if pair is not None:
+                summaries.extend(pair[1].summaries_for(items))
         if kind == "consolidate":
             prompt = assistant.build_consolidate_prompt(req, summaries)
         else:

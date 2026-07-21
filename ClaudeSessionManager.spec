@@ -2,19 +2,20 @@
 """PyInstaller build spec — single-file (onefile) build.
 
 Produces one self-contained ``ClaudeSessionManager`` executable (no ``_internal``
-folder beside it). Onefile extracts its payload to a temp dir on each launch, so
-a native splash screen is shown by the bootloader during that extraction to keep
-cold start feeling responsive; the app closes it once the first page paints.
+folder beside it). The build deliberately omits Tk/splash payloads and only
+bundles the Linux compatibility library on Linux.
 
 Build:  uv run pyinstaller --noconfirm ClaudeSessionManager.spec
         (PyInstaller cannot cross-compile — run this on the target OS.)
 """
 
+import sys
+
 # Trim clearly-unused heavy libraries so there's less to extract on launch.
 # NB: kept conservative — nothing QtWebEngineWidgets/WebChannel depends on.
 EXCLUDES = [
     "matplotlib", "numpy", "scipy", "pandas", "PIL", "IPython",
-    "pytest", "notebook",
+    "pytest", "notebook", "unittest", "pydoc", "tkinter", "_tkinter",
     # QtQml/QtQuick are intentionally NOT excluded — QtWebEngine can pull them in.
     "PySide6.Qt3DCore", "PySide6.QtCharts", "PySide6.QtDataVisualization",
     "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets", "PySide6.QtSensors",
@@ -26,43 +27,36 @@ a = Analysis(
     ["launcher.py"],
     pathex=[],
     binaries=[],
-    datas=[("web", "web"), ("vendor", "vendor")],
+    datas=[("web", "web")] + ([("vendor", "vendor")] if sys.platform.startswith("linux") else []),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=EXCLUDES,
     noarchive=False,
-    optimize=1,
+    optimize=2,
 )
+
+# PySide's hooks collect every Qt translation and Chromium locale. The UI is
+# English and the primary workstation locale is German, so retaining only
+# those two avoids shipping dozens of never-used locale packs.
+def _keep_locale(item):
+    dest = item[0].replace("\\", "/")
+    if "/translations/qtwebengine_locales/" in dest:
+        return dest.endswith(("/en-US.pak", "/de.pak"))
+    if "/translations/" in dest and dest.endswith(".qm"):
+        return dest.endswith(("_en.qm", "_de.qm"))
+    return True
+
+
+a.datas = [item for item in a.datas if _keep_locale(item)]
 pyz = PYZ(a.pure)
-
-# The onefile splash needs Tcl/Tk (bundled with Windows Python; may be absent on
-# a bare Linux box). Build it only when available so the spec stays portable —
-# the app's splash-close hook is a no-op when no splash was bundled.
-try:
-    import tkinter  # noqa: F401
-
-    splash = Splash(
-        "web/icons/app-512.png",
-        binaries=a.binaries,
-        datas=a.datas,
-        text_pos=(10, 20),
-        text_size=9,
-        text_color="#8a8378",
-        minify_script=True,
-        always_on_top=True,
-    )
-    _splash_toc = [splash, splash.binaries]
-except Exception:
-    _splash_toc = []
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
     a.datas,
-    *_splash_toc,
     [],
     name="ClaudeSessionManager",
     debug=False,

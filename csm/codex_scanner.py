@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import time
 from collections import Counter
 from pathlib import Path
@@ -56,6 +57,9 @@ class CodexScanner:
         self._child_summaries: dict[str, list[SessionSummary]] = {}
         self._titles: dict[str, str] = {}
         self._title_stamp: tuple[int, int] | None = None
+        self._archived: dict[str, float] = {}
+        self._archive_state_known = False
+        self._archive_stamp: tuple[str, int, int] | None = None
 
     # -- incremental parsing -------------------------------------------------
 
@@ -117,6 +121,7 @@ class CodexScanner:
 
     def _discover(self) -> None:
         self._load_titles()
+        self._load_archived_state()
         summaries: list[SessionSummary] = []
         if self.sessions_root.is_dir():
             for rollout in self.sessions_root.rglob("*.jsonl"):
@@ -161,13 +166,51 @@ class CodexScanner:
         self._root_summaries = roots
         self._child_summaries = children
 
+    def _load_archived_state(self) -> None:
+        """Read Codex's versioned state database without ever mutating it."""
+        candidates = sorted(self.home.glob("state_*.sqlite"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        if not candidates:
+            self._archived = {}
+            self._archive_state_known = False
+            self._archive_stamp = None
+            return
+        try:
+            stat = candidates[0].stat()
+            stamp = (str(candidates[0]), stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            stamp = None
+        if stamp is not None and stamp == self._archive_stamp:
+            return
+        self._archived = {}
+        self._archive_state_known = False
+        db = None
+        try:
+            uri = candidates[0].resolve().as_uri() + "?mode=ro"
+            db = sqlite3.connect(uri, uri=True, timeout=1)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
+            if not {"id", "archived"}.issubset(columns):
+                return
+            archived_at = "archived_at" if "archived_at" in columns else "NULL"
+            rows = db.execute(f"SELECT id, {archived_at} FROM threads WHERE archived = 1").fetchall()
+            self._archived = {str(sid): float(archived_at or 0) for sid, archived_at in rows}
+            self._archive_state_known = True
+            self._archive_stamp = stamp
+        except (OSError, sqlite3.Error, ValueError):
+            return
+        finally:
+            if db is not None:
+                db.close()
+
+    def _visible_roots(self):
+        return (summary for sid, summary in self._root_summaries.items() if sid not in self._archived)
+
     # -- projects and summaries ---------------------------------------------
 
     def scan_projects(self) -> list[dict]:
         self._discover()
         now = time.time()
         grouped: dict[str, list[SessionSummary]] = {}
-        for summary in self._root_summaries.values():
+        for summary in self._visible_roots():
             grouped.setdefault(_project_id(summary.cwd), []).append(summary)
         result: list[dict] = []
         for pid, summaries in grouped.items():
@@ -194,7 +237,7 @@ class CodexScanner:
         self._discover()
         now = time.time()
         result: list[dict] = []
-        for summary in self._root_summaries.values():
+        for summary in self._visible_roots():
             if _project_id(summary.cwd) != project_id:
                 continue
             item = summary.to_dict()
@@ -331,6 +374,9 @@ class CodexScanner:
                 "has_subagents": summary.has_subagents,
                 "child_session_count": len(self._child_summaries.get(summary.session_id, [])),
                 "models": list(summary.models),
+                "archived": summary.session_id in self._archived,
+                "archived_at": self._archived.get(summary.session_id, 0),
+                "archive_state_known": self._archive_state_known,
             })
         records.sort(key=lambda item: item["size_bytes"], reverse=True)
         return {
@@ -349,7 +395,7 @@ class CodexScanner:
         days: Counter[str] = Counter()
         now = time.time()
         active = prompts = turns = tool_calls = subagent_sessions = 0
-        for summary in self._root_summaries.values():
+        for summary in self._visible_roots():
             _add_usage(usage, summary.usage)
             prompts += summary.user_messages
             turns += summary.assistant_messages
@@ -373,7 +419,7 @@ class CodexScanner:
             "cost": 0.0,
             "cost_available": False,
             "usage": usage,
-            "sessions": len(self._root_summaries),
+            "sessions": sum(1 for _ in self._visible_roots()),
             "active": active,
             "prompts": prompts,
             "turns": turns,
@@ -391,7 +437,7 @@ class CodexScanner:
             return {"provider": "codex", "sessions": [], "prompts": []}
         sessions: list[dict] = []
         prompts: list[dict] = []
-        for summary in self._root_summaries.values():
+        for summary in self._visible_roots():
             haystack = " ".join((summary.title, summary.first_prompt, summary.cwd, summary.session_id)).lower()
             if needle in haystack:
                 sessions.append({
