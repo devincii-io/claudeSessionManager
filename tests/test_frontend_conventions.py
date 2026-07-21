@@ -23,6 +23,15 @@ class FrontendConventionTests(unittest.TestCase):
             + ", ".join(offenders),
         )
 
+    def test_bar_fill_accepts_calculated_width(self) -> None:
+        css = (Path(__file__).resolve().parents[1] / "web" / "styles.css").read_text("utf-8")
+        rules = re.findall(r"\.bar-fill\s*\{([^}]+)\}", css)
+        self.assertTrue(rules, "Missing shared .bar-fill style")
+        self.assertTrue(
+            any(re.search(r"\bdisplay\s*:\s*(?:block|inline-block|flex)\s*;", rule) for rule in rules),
+            "The bar fill is a span; without non-inline display its percentage width is ignored",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
